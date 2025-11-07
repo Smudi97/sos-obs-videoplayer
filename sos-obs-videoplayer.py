@@ -22,7 +22,8 @@ config = {
     'OBS_PORT': 4455,
     'OBS_PASSWORD': "",
     'OBS_SCENE_NAME': "",
-    'CURRENT_MATCH': 0,  # 0-5 für Match 1-6
+    'MATCHUP_SCENE_NAME': "",
+    'CURRENT_MATCH': 0,  # 0-6 für Match 1-7
     'MATCHES': [
         {'blue_team': "HSMW", 'orange_team': "UIA"},
         {'blue_team': "WHZ", 'orange_team': "TLU"},
@@ -30,6 +31,7 @@ config = {
         {'blue_team': "TLU", 'orange_team': "UIA"},
         {'blue_team': "HSMW", 'orange_team': "LES"},
         {'blue_team': "UIA", 'orange_team': "WHZ"},
+        {'blue_team': "HSMW", 'orange_team': "HSMW"},
     ]
 }
 
@@ -173,6 +175,60 @@ class OBSSOSController:
             video_name = get_video_name(match['orange_team'], "PINK")
             self.play_video(video_name)
     
+    def play_matchup_video(self):
+        """Spiele Matchup Video mit aktuellem Match"""
+        if not self.ensure_obs_connected():
+            print("✗ OBS nicht verfügbar")
+            return
+        
+        if not config['MATCHUP_SCENE_NAME']:
+            print("✗ Matchup Scene nicht konfiguriert")
+            return
+        
+        match_idx = config['CURRENT_MATCH']
+        match = config['MATCHES'][match_idx]
+        blue_team = match['blue_team']
+        orange_team = match['orange_team']
+        
+        # Generiere Matchup Video Namen
+        matchup_video = f"{blue_team} vs {orange_team}.mp4"
+        
+        try:
+            scene_name = config['MATCHUP_SCENE_NAME']
+            
+            # Finde Scene Item ID
+            scene_items = self.obs.call(obs_requests.GetSceneItemList(sceneName=scene_name))
+            scene_item_id = None
+            for item in scene_items.datain['sceneItems']:
+                if item['sourceName'] == matchup_video:
+                    scene_item_id = item['sceneItemId']
+                    break
+            
+            if scene_item_id is None:
+                print(f"✗ Matchup Video '{matchup_video}' nicht gefunden in Scene '{scene_name}'")
+                return
+            
+            # Source sichtbar machen
+            self.obs.call(obs_requests.SetSceneItemEnabled(
+                sceneName=scene_name,
+                sceneItemId=scene_item_id,
+                sceneItemEnabled=True
+            ))
+            print(f"✓ Matchup Source sichtbar: {matchup_video}")
+            
+            # Video abspielen
+            self.obs.call(obs_requests.TriggerMediaInputAction(
+                inputName=matchup_video,
+                mediaAction="OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
+            ))
+            print(f"▶ Matchup Video gestartet: {matchup_video}")
+            
+            # Source nach dem Video wieder unsichtbar machen (asynchron)
+            self.hide_video_later(scene_name, scene_item_id, matchup_video)
+            
+        except Exception as e:
+            print(f"✗ Fehler beim Abspielen des Matchup Videos: {e}")
+    
     async def listen_sos_events(self):
         """Auf SOS Events lauschen mit automatischer Wiederverbindung"""
         while True:
@@ -228,7 +284,7 @@ class ConfigGUI:
         self.root = root
         self.root.title("OBS SOS Video Player - Konfiguration")
         self.root.geometry("700x650")
-        self.root.resizable(False, True)
+        self.root.resizable(True, True)
         
         # Create Canvas with Scrollbar
         canvas = tk.Canvas(root)
@@ -285,22 +341,33 @@ class ConfigGUI:
         self.obs_scene_input.grid(row=5, column=1, padx=20, pady=5, sticky="w")
         self.obs_scene_input.bind('<KeyRelease>', self.update_config)
         
+        # Matchup Scene Name
+        ttk.Label(main_frame, text="Matchup Scene:").grid(row=5, column=2, sticky="w", padx=20, pady=5)
+        self.matchup_scene_input = ttk.Entry(main_frame, width=25)
+        self.matchup_scene_input.insert(0, config['MATCHUP_SCENE_NAME'])
+        self.matchup_scene_input.grid(row=6, column=2, padx=20, pady=5, sticky="w")
+        self.matchup_scene_input.bind('<KeyRelease>', self.update_config)
+        
+        # Play Matchup Button
+        self.play_matchup_btn = ttk.Button(main_frame, text="▶ Play Matchup", command=self.play_matchup)
+        self.play_matchup_btn.grid(row=7, column=2, padx=20, pady=5, sticky="w")
+        
         # Matches Section
         matches_label = ttk.Label(main_frame, text="Matches", font=("Arial", 11, "bold"), foreground="blue")
-        matches_label.grid(row=6, column=0, columnspan=3, pady=(15, 10), sticky="w", padx=10)
+        matches_label.grid(row=8, column=0, columnspan=3, pady=(15, 10), sticky="w", padx=10)
         
         # Column headers
-        ttk.Label(main_frame, text="Match", font=("Arial", 9, "bold")).grid(row=7, column=0, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Blue Team", font=("Arial", 9, "bold")).grid(row=7, column=1, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Orange Team", font=("Arial", 9, "bold")).grid(row=7, column=2, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Match", font=("Arial", 9, "bold")).grid(row=9, column=0, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Blue Team", font=("Arial", 9, "bold")).grid(row=9, column=1, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Orange Team", font=("Arial", 9, "bold")).grid(row=9, column=2, padx=10, pady=5, sticky="w")
         
         self.match_vars = []
         self.match_dropdowns_blue = []
         self.match_dropdowns_orange = []
         
-        # Create 6 matches
-        for i in range(6):
-            row = 8 + i
+        # Create 7 matches
+        for i in range(7):
+            row = 10 + i
             
             # Current Match Checkbox
             var = tk.BooleanVar(value=(i == config['CURRENT_MATCH']))
@@ -325,7 +392,7 @@ class ConfigGUI:
             self.match_dropdowns_orange.append(orange_dropdown)
         
         # Status Label
-        row = 14
+        row = 17
         self.status_label = ttk.Label(main_frame, text="🟢 Läuft", font=("Arial", 10), foreground="green")
         self.status_label.grid(row=row, column=0, columnspan=3, pady=20)
     
@@ -357,24 +424,40 @@ class ConfigGUI:
             pass
         config['OBS_PASSWORD'] = self.obs_password_input.get()
         config['OBS_SCENE_NAME'] = self.obs_scene_input.get()
+        config['MATCHUP_SCENE_NAME'] = self.matchup_scene_input.get()
+    
+    def play_matchup(self):
+        """Rufe play_matchup_video im Controller auf"""
+        # Der Controller wird global gespeichert, daher können wir ihn hier zugreifen
+        if hasattr(self, 'controller') and self.controller:
+            self.controller.play_matchup_video()
+        else:
+            print("✗ Controller nicht verfügbar")
 
-def run_async_in_thread(loop):
+def run_async_in_thread(loop, controller):
     """Führe den Async Loop in einem Thread aus"""
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(main())
+    loop.run_until_complete(controller.run())
 
 async def main():
     controller = OBSSOSController()
     await controller.run()
+
+# Global controller instance
+app_controller = None
 
 if __name__ == "__main__":
     # Starte GUI
     root = tk.Tk()
     gui = ConfigGUI(root)
     
+    # Erstelle Controller
+    app_controller = OBSSOSController()
+    gui.controller = app_controller
+    
     # Starte Async Loop in separatem Thread
     loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=run_async_in_thread, args=(loop,), daemon=True)
+    thread = threading.Thread(target=run_async_in_thread, args=(loop, app_controller), daemon=True)
     thread.start()
     
     # Starte GUI Main Loop
