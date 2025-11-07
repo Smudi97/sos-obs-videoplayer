@@ -18,6 +18,10 @@ SOS_PORT = 49122
 config = {
     'BLUE_TEAM': "HSMW",
     'ORANGE_TEAM': "HSMW",
+    'OBS_HOST': "localhost",
+    'OBS_PORT': 4455,
+    'OBS_PASSWORD': "",
+    'OBS_SCENE_NAME': "",
 }
 
 # Team Kürzel
@@ -35,9 +39,9 @@ class OBSSOSController:
     async def connect_obs(self):
         """Verbindung zu OBS WebSocket herstellen"""
         try:
-            self.obs = obsws(OBS_HOST, OBS_PORT, OBS_PASSWORD)
+            self.obs = obsws(config['OBS_HOST'], config['OBS_PORT'], config['OBS_PASSWORD'])
             self.obs.connect()
-            print(f"✓ Mit OBS verbunden")
+            print(f"✓ Mit OBS verbunden ({config['OBS_HOST']}:{config['OBS_PORT']})")
             return True
         except Exception as e:
             print(f"✗ OBS Fehler: {e}")
@@ -66,8 +70,12 @@ class OBSSOSController:
     def play_video(self, source_name):
         """Video abspielen und anzeigen"""
         try:
-            current_scene = self.obs.call(obs_requests.GetCurrentProgramScene())
-            scene_name = current_scene.datain['currentProgramSceneName']
+            # Nutze konfigurierte Scene oder aktuelle Scene
+            if config['OBS_SCENE_NAME']:
+                scene_name = config['OBS_SCENE_NAME']
+            else:
+                current_scene = self.obs.call(obs_requests.GetCurrentProgramScene())
+                scene_name = current_scene.datain['currentProgramSceneName']
             
             # Finde Scene Item ID
             scene_items = self.obs.call(obs_requests.GetSceneItemList(sceneName=scene_name))
@@ -184,34 +192,81 @@ class OBSSOSController:
 class ConfigGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("OBS SOS Video Player")
-        self.root.geometry("400x220")
+        self.root.title("OBS SOS Video Player - Konfiguration")
+        self.root.geometry("500x420")
         self.root.resizable(False, False)
         
-        # Title
-        title = ttk.Label(root, text="Team Auswahl", font=("Arial", 14, "bold"))
-        title.grid(row=0, column=0, columnspan=2, pady=20)
+        # Main Frame mit Scrollbar
+        main_frame = ttk.Frame(root)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
-        # Blue Team Label und Dropdown
-        ttk.Label(root, text="Blue Team:").grid(row=1, column=0, sticky="w", padx=20, pady=10)
-        self.blue_dropdown = ttk.Combobox(root, values=TEAMS, state="readonly", width=27)
+        # Title
+        title = ttk.Label(main_frame, text="Konfiguration", font=("Arial", 14, "bold"))
+        title.grid(row=0, column=0, columnspan=2, pady=10, sticky="w")
+        
+        # OBS Configuration Section
+        obs_label = ttk.Label(main_frame, text="OBS WebSocket", font=("Arial", 11, "bold"), foreground="blue")
+        obs_label.grid(row=1, column=0, columnspan=2, pady=(10, 5), sticky="w")
+        
+        # OBS Host
+        ttk.Label(main_frame, text="Host:").grid(row=2, column=0, sticky="w", padx=20, pady=5)
+        self.obs_host_input = ttk.Entry(main_frame, width=25)
+        self.obs_host_input.insert(0, config['OBS_HOST'])
+        self.obs_host_input.grid(row=2, column=1, padx=20, pady=5, sticky="w")
+        self.obs_host_input.bind('<KeyRelease>', self.update_config)
+        
+        # OBS Port
+        ttk.Label(main_frame, text="Port:").grid(row=3, column=0, sticky="w", padx=20, pady=5)
+        self.obs_port_input = ttk.Entry(main_frame, width=25)
+        self.obs_port_input.insert(0, str(config['OBS_PORT']))
+        self.obs_port_input.grid(row=3, column=1, padx=20, pady=5, sticky="w")
+        self.obs_port_input.bind('<KeyRelease>', self.update_config)
+        
+        # OBS Password
+        ttk.Label(main_frame, text="Password:").grid(row=4, column=0, sticky="w", padx=20, pady=5)
+        self.obs_password_input = ttk.Entry(main_frame, width=25, show="*")
+        self.obs_password_input.insert(0, config['OBS_PASSWORD'])
+        self.obs_password_input.grid(row=4, column=1, padx=20, pady=5, sticky="w")
+        self.obs_password_input.bind('<KeyRelease>', self.update_config)
+        
+        # OBS Scene Name
+        ttk.Label(main_frame, text="Scene Name:").grid(row=5, column=0, sticky="w", padx=20, pady=5)
+        self.obs_scene_input = ttk.Entry(main_frame, width=25)
+        self.obs_scene_input.insert(0, config['OBS_SCENE_NAME'])
+        self.obs_scene_input.grid(row=5, column=1, padx=20, pady=5, sticky="w")
+        self.obs_scene_input.bind('<KeyRelease>', self.update_config)
+        
+        # Team Selection Section
+        teams_label = ttk.Label(main_frame, text="Team Auswahl", font=("Arial", 11, "bold"), foreground="blue")
+        teams_label.grid(row=6, column=0, columnspan=2, pady=(15, 5), sticky="w")
+        
+        # Blue Team
+        ttk.Label(main_frame, text="Blue Team:").grid(row=7, column=0, sticky="w", padx=20, pady=5)
+        self.blue_dropdown = ttk.Combobox(main_frame, values=TEAMS, state="readonly", width=22)
         self.blue_dropdown.set(config['BLUE_TEAM'])
-        self.blue_dropdown.grid(row=1, column=1, padx=20, pady=10)
+        self.blue_dropdown.grid(row=7, column=1, padx=20, pady=5, sticky="w")
         self.blue_dropdown.bind('<<ComboboxSelected>>', self.update_config)
         
-        # Orange Team Label und Dropdown
-        ttk.Label(root, text="Orange Team:").grid(row=2, column=0, sticky="w", padx=20, pady=10)
-        self.orange_dropdown = ttk.Combobox(root, values=TEAMS, state="readonly", width=27)
+        # Orange Team
+        ttk.Label(main_frame, text="Orange Team:").grid(row=8, column=0, sticky="w", padx=20, pady=5)
+        self.orange_dropdown = ttk.Combobox(main_frame, values=TEAMS, state="readonly", width=22)
         self.orange_dropdown.set(config['ORANGE_TEAM'])
-        self.orange_dropdown.grid(row=2, column=1, padx=20, pady=10)
+        self.orange_dropdown.grid(row=8, column=1, padx=20, pady=5, sticky="w")
         self.orange_dropdown.bind('<<ComboboxSelected>>', self.update_config)
         
         # Status Label
-        self.status_label = ttk.Label(root, text="🟢 Läuft", font=("Arial", 10), foreground="green")
-        self.status_label.grid(row=3, column=0, columnspan=2, pady=15)
+        self.status_label = ttk.Label(main_frame, text="🟢 Läuft", font=("Arial", 10), foreground="green")
+        self.status_label.grid(row=9, column=0, columnspan=2, pady=20)
         
     def update_config(self, event=None):
         """Aktualisiere Config in Echtzeit"""
+        config['OBS_HOST'] = self.obs_host_input.get()
+        try:
+            config['OBS_PORT'] = int(self.obs_port_input.get())
+        except ValueError:
+            pass
+        config['OBS_PASSWORD'] = self.obs_password_input.get()
+        config['OBS_SCENE_NAME'] = self.obs_scene_input.get()
         config['BLUE_TEAM'] = self.blue_dropdown.get()
         config['ORANGE_TEAM'] = self.orange_dropdown.get()
 
