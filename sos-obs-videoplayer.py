@@ -22,6 +22,15 @@ config = {
     'OBS_PORT': 4455,
     'OBS_PASSWORD': "",
     'OBS_SCENE_NAME': "",
+    'CURRENT_MATCH': 0,  # 0-5 für Match 1-6
+    'MATCHES': [
+        {'blue_team': "HSMW", 'orange_team': "UIA"},
+        {'blue_team': "WHZ", 'orange_team': "TLU"},
+        {'blue_team': "LES", 'orange_team': "UIA"},
+        {'blue_team': "TLU", 'orange_team': "UIA"},
+        {'blue_team': "HSMW", 'orange_team': "LES"},
+        {'blue_team': "UIA", 'orange_team': "WHZ"},
+    ]
 }
 
 # Team Kürzel
@@ -47,6 +56,16 @@ class OBSSOSController:
             print(f"✗ OBS Fehler: {e}")
             return False
     
+    async def connect_obs_with_retry(self, max_retries=None):
+        """Verbindung zu OBS mit automatischen Wiederholung"""
+        retry_count = 0
+        while True:
+            if await self.connect_obs():
+                return True
+            retry_count += 1
+            print(f"⏳ OBS Wiederverbindung in 5 Sekunden... (Versuch {retry_count})")
+            await asyncio.sleep(5)
+    
     async def connect_sos(self):
         """Verbindung zu SOS WebSocket herstellen"""
         try:
@@ -67,8 +86,20 @@ class OBSSOSController:
             print(f"⏳ Wiederverbindung in 5 Sekunden... (Versuch {retry_count})")
             await asyncio.sleep(5)
     
+    def ensure_obs_connected(self):
+        """Stelle sicher, dass OBS verbunden ist, versuche sonst neu zu verbinden"""
+        if self.obs is None:
+            print("⚠ OBS nicht verbunden, versuche zu verbinden...")
+            asyncio.create_task(self.connect_obs_with_retry())
+            return False
+        return True
+    
     def play_video(self, source_name):
         """Video abspielen und anzeigen"""
+        if not self.ensure_obs_connected():
+            print("✗ OBS nicht verfügbar, Video kann nicht abgespielt werden")
+            return
+            
         try:
             # Nutze konfigurierte Scene oder aktuelle Scene
             if config['OBS_SCENE_NAME']:
@@ -130,13 +161,16 @@ class OBSSOSController:
     
     def handle_match_ended(self, winner_team_num):
         """Match beendet - spiele Video ab"""
+        match_idx = config['CURRENT_MATCH']
+        match = config['MATCHES'][match_idx]
+        
         if winner_team_num == 0:  # Blue gewonnen
-            print("🎉 BLUE TEAM GEWINNT!")
-            video_name = get_video_name(config['BLUE_TEAM'], "BLAU")
+            print(f"🎉 BLUE TEAM GEWINNT (Match {match_idx + 1})!")
+            video_name = get_video_name(match['blue_team'], "BLAU")
             self.play_video(video_name)
         else:  # Orange gewonnen
-            print("🎉 ORANGE TEAM GEWINNT!")
-            video_name = get_video_name(config['ORANGE_TEAM'], "PINK")
+            print(f"🎉 ORANGE TEAM GEWINNT (Match {match_idx + 1})!")
+            video_name = get_video_name(match['orange_team'], "PINK")
             self.play_video(video_name)
     
     async def listen_sos_events(self):
@@ -170,7 +204,7 @@ class OBSSOSController:
         """Hauptloop"""
         print("=== OBS + SOS Video Player ===\n")
         
-        if not await self.connect_obs():
+        if not await self.connect_obs_with_retry():
             return
         
         if not await self.connect_sos_with_retry():
@@ -193,20 +227,35 @@ class ConfigGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("OBS SOS Video Player - Konfiguration")
-        self.root.geometry("500x420")
-        self.root.resizable(False, False)
+        self.root.geometry("700x650")
+        self.root.resizable(False, True)
         
-        # Main Frame mit Scrollbar
-        main_frame = ttk.Frame(root)
-        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # Create Canvas with Scrollbar
+        canvas = tk.Canvas(root)
+        scrollbar = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack Canvas and Scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        main_frame = scrollable_frame
         
         # Title
         title = ttk.Label(main_frame, text="Konfiguration", font=("Arial", 14, "bold"))
-        title.grid(row=0, column=0, columnspan=2, pady=10, sticky="w")
+        title.grid(row=0, column=0, columnspan=3, pady=10, sticky="w", padx=10)
         
         # OBS Configuration Section
         obs_label = ttk.Label(main_frame, text="OBS WebSocket", font=("Arial", 11, "bold"), foreground="blue")
-        obs_label.grid(row=1, column=0, columnspan=2, pady=(10, 5), sticky="w")
+        obs_label.grid(row=1, column=0, columnspan=3, pady=(10, 5), sticky="w", padx=10)
         
         # OBS Host
         ttk.Label(main_frame, text="Host:").grid(row=2, column=0, sticky="w", padx=20, pady=5)
@@ -236,28 +285,69 @@ class ConfigGUI:
         self.obs_scene_input.grid(row=5, column=1, padx=20, pady=5, sticky="w")
         self.obs_scene_input.bind('<KeyRelease>', self.update_config)
         
-        # Team Selection Section
-        teams_label = ttk.Label(main_frame, text="Team Auswahl", font=("Arial", 11, "bold"), foreground="blue")
-        teams_label.grid(row=6, column=0, columnspan=2, pady=(15, 5), sticky="w")
+        # Matches Section
+        matches_label = ttk.Label(main_frame, text="Matches", font=("Arial", 11, "bold"), foreground="blue")
+        matches_label.grid(row=6, column=0, columnspan=3, pady=(15, 10), sticky="w", padx=10)
         
-        # Blue Team
-        ttk.Label(main_frame, text="Blue Team:").grid(row=7, column=0, sticky="w", padx=20, pady=5)
-        self.blue_dropdown = ttk.Combobox(main_frame, values=TEAMS, state="readonly", width=22)
-        self.blue_dropdown.set(config['BLUE_TEAM'])
-        self.blue_dropdown.grid(row=7, column=1, padx=20, pady=5, sticky="w")
-        self.blue_dropdown.bind('<<ComboboxSelected>>', self.update_config)
+        # Column headers
+        ttk.Label(main_frame, text="Match", font=("Arial", 9, "bold")).grid(row=7, column=0, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Blue Team", font=("Arial", 9, "bold")).grid(row=7, column=1, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Orange Team", font=("Arial", 9, "bold")).grid(row=7, column=2, padx=10, pady=5, sticky="w")
         
-        # Orange Team
-        ttk.Label(main_frame, text="Orange Team:").grid(row=8, column=0, sticky="w", padx=20, pady=5)
-        self.orange_dropdown = ttk.Combobox(main_frame, values=TEAMS, state="readonly", width=22)
-        self.orange_dropdown.set(config['ORANGE_TEAM'])
-        self.orange_dropdown.grid(row=8, column=1, padx=20, pady=5, sticky="w")
-        self.orange_dropdown.bind('<<ComboboxSelected>>', self.update_config)
+        self.match_vars = []
+        self.match_dropdowns_blue = []
+        self.match_dropdowns_orange = []
+        
+        # Create 6 matches
+        for i in range(6):
+            row = 8 + i
+            
+            # Current Match Checkbox
+            var = tk.BooleanVar(value=(i == config['CURRENT_MATCH']))
+            self.match_vars.append(var)
+            
+            check = ttk.Checkbutton(main_frame, text=f"Match {i+1}", variable=var, 
+                                   command=lambda idx=i: self.set_current_match(idx))
+            check.grid(row=row, column=0, padx=20, pady=5, sticky="w")
+            
+            # Blue Team Dropdown
+            blue_dropdown = ttk.Combobox(main_frame, values=TEAMS, state="readonly", width=15)
+            blue_dropdown.set(config['MATCHES'][i]['blue_team'])
+            blue_dropdown.grid(row=row, column=1, padx=10, pady=5, sticky="w")
+            blue_dropdown.bind('<<ComboboxSelected>>', lambda e, idx=i: self.update_match(idx, 'blue'))
+            self.match_dropdowns_blue.append(blue_dropdown)
+            
+            # Orange Team Dropdown
+            orange_dropdown = ttk.Combobox(main_frame, values=TEAMS, state="readonly", width=15)
+            orange_dropdown.set(config['MATCHES'][i]['orange_team'])
+            orange_dropdown.grid(row=row, column=2, padx=10, pady=5, sticky="w")
+            orange_dropdown.bind('<<ComboboxSelected>>', lambda e, idx=i: self.update_match(idx, 'orange'))
+            self.match_dropdowns_orange.append(orange_dropdown)
         
         # Status Label
+        row = 14
         self.status_label = ttk.Label(main_frame, text="🟢 Läuft", font=("Arial", 10), foreground="green")
-        self.status_label.grid(row=9, column=0, columnspan=2, pady=20)
+        self.status_label.grid(row=row, column=0, columnspan=3, pady=20)
+    
+    def set_current_match(self, match_idx):
+        """Setze aktuelles Match"""
+        # Deselect all other matches
+        for i, var in enumerate(self.match_vars):
+            if i != match_idx:
+                var.set(False)
+            else:
+                var.set(True)
         
+        config['CURRENT_MATCH'] = match_idx
+        print(f"🎯 Aktuelles Match geändert zu: Match {match_idx + 1}")
+    
+    def update_match(self, match_idx, team_type):
+        """Update Match Teams"""
+        if team_type == 'blue':
+            config['MATCHES'][match_idx]['blue_team'] = self.match_dropdowns_blue[match_idx].get()
+        else:
+            config['MATCHES'][match_idx]['orange_team'] = self.match_dropdowns_orange[match_idx].get()
+    
     def update_config(self, event=None):
         """Aktualisiere Config in Echtzeit"""
         config['OBS_HOST'] = self.obs_host_input.get()
@@ -267,8 +357,6 @@ class ConfigGUI:
             pass
         config['OBS_PASSWORD'] = self.obs_password_input.get()
         config['OBS_SCENE_NAME'] = self.obs_scene_input.get()
-        config['BLUE_TEAM'] = self.blue_dropdown.get()
-        config['ORANGE_TEAM'] = self.orange_dropdown.get()
 
 def run_async_in_thread(loop):
     """Führe den Async Loop in einem Thread aus"""
