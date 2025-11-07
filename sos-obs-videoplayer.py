@@ -143,11 +143,11 @@ class OBSSOSController:
         except Exception as e:
             print(f"✗ Fehler beim Abspielen: {e}")
     
-    def hide_video_later(self, scene_name, scene_item_id, source_name):
+    def hide_video_later(self, scene_name, scene_item_id, source_name, delay=10):
         """Verstecke Video nach Verzögerung in separatem Thread"""
         def hide():
             import time
-            time.sleep(10)  # Warte 10 Sekunden (anpassen falls nötig)
+            time.sleep(delay)
             try:
                 self.obs.call(obs_requests.SetSceneItemEnabled(
                     sceneName=scene_name,
@@ -223,8 +223,8 @@ class OBSSOSController:
             ))
             print(f"▶ Matchup Video gestartet: {matchup_video}")
             
-            # Source nach dem Video wieder unsichtbar machen (asynchron)
-            self.hide_video_later(scene_name, scene_item_id, matchup_video)
+            # Source nach 77 Sekunden wieder unsichtbar machen (asynchron)
+            self.hide_video_later(scene_name, scene_item_id, matchup_video, delay=77)
             
         except Exception as e:
             print(f"✗ Fehler beim Abspielen des Matchup Videos: {e}")
