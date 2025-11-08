@@ -8,11 +8,16 @@
   "MATCHUP_SCENE_NAME": "SCN Matchup Animation",
   "AUDIO_SCENE_NAME": "SCN Musik-Output",
   "AUDIO_SOURCE_NAME": "MED Game Win Stinger Audio",
+  "GOAL_VIDEO_SCENE_NAME": "SCN Goal Video",
+  "GOAL_VIDEO_SOURCE_NAME": "MED Goal Video",
+  "GOAL_AUDIO_SOURCE_NAME": "MED Goal Audio",
   "OBS2_HOST": "localhost",
   "OBS2_PORT": 4455,
   "OBS2_PASSWORD": "",
   "SOS_HOST": "localhost",
   "SOS_PORT": 49322,
+  "COMPANION_WEBSOCKET_PORT": 55555,
+  "COMPANION_ENABLED": true,
   "CURRENT_MATCH": 0,
   "MATCHES": [
     {
@@ -43,7 +48,5 @@
       "blue_team": "HSMW",
       "orange_team": "HSMW"
     }
-  ],
-  "COMPANION_WEBSOCKET_PORT": 55555,
-  "COMPANION_ENABLED": true
+  ]
 }
