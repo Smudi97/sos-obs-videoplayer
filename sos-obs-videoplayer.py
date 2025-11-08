@@ -1,30 +1,71 @@
+"""
+SOS OBS Video Player - Automated Video Playback Control System
+
+This application bridges OBS (Open Broadcaster Software) with SOS (Rocket League tournament API) to automatically
+play victory animations and audio when match events occur. It supports dual OBS instances for streaming and monitoring,
+with a GUI for configuration and manual testing.
+
+Key Features:
+- Listens to SOS WebSocket events for match end notifications
+- Automatically plays team-specific victory videos on match completion
+- Plays audio stings synchronized across both OBS instances
+- Displays matchup videos before matches
+- GUI for configuration, match management, and manual testing
+- Automatic retry logic for connection failures
+- Real-time configuration persistence
+
+Architecture:
+- OBSSOSController: Main application logic and event handling
+- ConfigGUI: Configuration interface and manual controls
+- Async event loop: Handles SOS WebSocket listening
+- Threading: Manages GUI and async operations concurrently
+"""
+
 import asyncio
 import json
 import os
+import time
+import threading
 from obswebsocket import obsws, requests as obs_requests
 import websockets
 import tkinter as tk
 from tkinter import ttk
-import threading
+
+# ============================================================================
+# Configuration Constants
+# ============================================================================
 
 CONFIG_FILE = "config.json"
+
+# Delay constants (in seconds) for hiding media sources after playback
+HIDE_VIDEO_DELAY = 10          # Time to keep victory video visible
+HIDE_MATCHUP_DELAY = 77        # Time to keep matchup video visible (full duration)
+HIDE_AUDIO_DELAY = 5           # Time to keep audio playing before hiding source
+
+# Connection retry settings
+RETRY_DELAY = 5                # Seconds to wait before retrying connection
+MAX_RETRY_ATTEMPTS = 0         # 0 = infinite retries
+
+# WebSocket and API constants
+OBS_WEBSOCKET_PORT = 4455      # Default OBS WebSocket port
+SOS_WEBSOCKET_PORT = 49322     # Default SOS WebSocket port
 
 # Global Config - wird durch GUI aktualisiert
 config = {
     'BLUE_TEAM': "HSMW",
     'ORANGE_TEAM': "HSMW",
     'OBS_HOST': "localhost",
-    'OBS_PORT': 4455,
+    'OBS_PORT': OBS_WEBSOCKET_PORT,
     'OBS_PASSWORD': "",
     'WIN_SCENE_NAME': "SCN Win Animation",
     'MATCHUP_SCENE_NAME': "SCN Matchup Animation",
     'AUDIO_SCENE_NAME': "SCN Musik-Output",
     'AUDIO_SOURCE_NAME': "MED Game Win Stinger Audio",
     'OBS2_HOST': "localhost",
-    'OBS2_PORT': 4455,
+    'OBS2_PORT': OBS_WEBSOCKET_PORT,
     'OBS2_PASSWORD': "",
     'SOS_HOST': "localhost",
-    'SOS_PORT': 49322,
+    'SOS_PORT': SOS_WEBSOCKET_PORT,
     'CURRENT_MATCH': 0,  # 0-6 für Match 1-7
     'MATCHES': [
         {'blue_team': "HSMW", 'orange_team': "UIA B"},
@@ -40,12 +81,24 @@ config = {
 # Team Kürzel
 TEAMS = ["HSMW", "LES", "UIA A", "UIA B", "WHZ", "TLU"]
 
-def get_video_name(team_kuerzel, color):
-    """Generiere Video-Namen nach dem Muster: WIN [TEAM] [COLOR].mp4"""
+def get_video_name(team_kuerzel: str, color: str) -> str:
+    """Generate video filename for team victory animation.
+    
+    Args:
+        team_kuerzel: Team abbreviation (e.g., 'HSMW', 'LES')
+        color: Team color in German ('BLAU' for blue, 'PINK' for orange)
+    
+    Returns:
+        Formatted video filename (e.g., 'WIN HSMW BLAU.mp4')
+    """
     return f"WIN {team_kuerzel} {color}.mp4"
 
-def save_config():
-    """Speichere Config in JSON Datei"""
+def save_config() -> None:
+    """Persist current configuration to JSON file.
+    
+    Saves the global config dict to CONFIG_FILE. If file write fails,
+    prints error message but doesn't raise exception.
+    """
     try:
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f, indent=2)
@@ -53,8 +106,15 @@ def save_config():
     except Exception as e:
         print(f"✗ Fehler beim Speichern der Config: {e}")
 
-def load_config():
-    """Lade Config aus JSON Datei"""
+def load_config() -> bool:
+    """Load configuration from JSON file.
+    
+    Loads configuration from CONFIG_FILE if it exists, merging with
+    default values. If file doesn't exist, uses default values.
+    
+    Returns:
+        True if config file was found and loaded, False otherwise
+    """
     global config
     try:
         if os.path.exists(CONFIG_FILE):
@@ -71,152 +131,186 @@ def load_config():
         print(f"✗ Fehler beim Laden der Config: {e}")
         return False
 
+def validate_config() -> tuple[bool, list[str]]:
+    """Validate that all required configuration keys are present.
+    
+    Returns:
+        Tuple of (is_valid: bool, missing_keys: list[str])
+    """
+    required_keys = [
+        'OBS_HOST', 'OBS_PORT', 'OBS_PASSWORD',
+        'OBS2_HOST', 'OBS2_PORT', 'OBS2_PASSWORD',
+        'WIN_SCENE_NAME', 'MATCHUP_SCENE_NAME', 'AUDIO_SCENE_NAME', 'AUDIO_SOURCE_NAME',
+        'SOS_HOST', 'SOS_PORT', 'MATCHES'
+    ]
+    
+    missing_keys = [key for key in required_keys if key not in config]
+    
+    if missing_keys:
+        return False, missing_keys
+    return True, []
+
 class OBSSOSController:
-    def __init__(self):
-        self.obs = None
-        self.obs2 = None
-        self.sos_ws = None
+    """Main controller for OBS and SOS integration.
+    
+    Manages connections to two OBS instances and SOS WebSocket server.
+    Listens for match end events and triggers automatic playback of videos
+    and audio on both OBS instances.
+    """
+    
+    def __init__(self) -> None:
+        """Initialize controller with no active connections."""
+        self.obs: obsws | None = None           # OBS instance 1 connection
+        self.obs2: obsws | None = None          # OBS instance 2 connection
+        self.sos_ws: websockets.WebSocketClientProtocol | None = None  # SOS connection
+    
+    async def _connect_obs_instance(self, instance_num: int) -> bool:
+        """Connect to OBS instance (1 or 2) with retry logic.
         
-    async def connect_obs(self):
-        """Verbindung zu OBS WebSocket herstellen"""
-        try:
-            self.obs = obsws(config['OBS_HOST'], config['OBS_PORT'], config['OBS_PASSWORD'])
-            self.obs.connect()
-            print(f"✓ Mit OBS verbunden ({config['OBS_HOST']}:{config['OBS_PORT']})")
-            return True
-        except Exception as e:
-            print(f"✗ OBS Fehler: {e}")
-            return False
-    
-    async def connect_obs_with_retry(self, max_retries=None):
-        """Verbindung zu OBS mit automatischen Wiederholung"""
+        Attempts to connect to the specified OBS instance using configured
+        host/port/password. Automatically retries on failure with a delay.
+        
+        Args:
+            instance_num: OBS instance number (1 or 2)
+        
+        Returns:
+            True if connection successful, False if aborted
+        
+        Raises:
+            Continues retrying indefinitely unless cancelled externally
+        """
+        config_prefix = '' if instance_num == 1 else '2'
+        obs_attr = f'obs{config_prefix}'
+        host_key = f'OBS{config_prefix}_HOST'
+        port_key = f'OBS{config_prefix}_PORT'
+        pass_key = f'OBS{config_prefix}_PASSWORD'
+        
         retry_count = 0
         while True:
-            if await self.connect_obs():
-                return True
-            retry_count += 1
-            print(f"⏳ OBS Wiederverbindung in 5 Sekunden... (Versuch {retry_count})")
-            await asyncio.sleep(5)
-    
-    async def connect_obs2(self):
-        """Verbindung zu zweiter OBS WebSocket herstellen"""
-        try:
-            self.obs2 = obsws(config['OBS2_HOST'], config['OBS2_PORT'], config['OBS2_PASSWORD'])
-            self.obs2.connect()
-            print(f"✓ Mit OBS 2 verbunden ({config['OBS2_HOST']}:{config['OBS2_PORT']})")
-            return True
-        except Exception as e:
-            print(f"✗ OBS 2 Fehler: {e}")
-            return False
-    
-    async def connect_obs2_with_retry(self, max_retries=None):
-        """Verbindung zu zweiter OBS mit automatischen Wiederholung"""
-        retry_count = 0
-        while True:
-            if await self.connect_obs2():
-                return True
-            retry_count += 1
-            print(f"⏳ OBS 2 Wiederverbindung in 5 Sekunden... (Versuch {retry_count})")
-            await asyncio.sleep(5)
-    
-    async def connect_sos(self):
-        """Verbindung zu SOS WebSocket herstellen"""
-        try:
-            self.sos_ws = await websockets.connect(f"ws://{config['SOS_HOST']}:{config['SOS_PORT']}")
-            print(f"✓ Mit SOS verbunden ({config['SOS_HOST']}:{config['SOS_PORT']})")
-            return True
-        except Exception as e:
-            print(f"✗ SOS Fehler: {e}")
-            return False
-    
-    async def connect_sos_with_retry(self, max_retries=None):
-        """Verbindung zu SOS mit automatischen Wiederholung"""
-        retry_count = 0
-        while True:
-            if await self.connect_sos():
-                return True
-            retry_count += 1
-            print(f"⏳ Wiederverbindung in 5 Sekunden... (Versuch {retry_count})")
-            await asyncio.sleep(5)
-    
-    def ensure_obs_connected(self):
-        """Stelle sicher, dass OBS verbunden ist, versuche sonst neu zu verbinden"""
-        if self.obs is None:
-            print("⚠ OBS nicht verbunden, versuche zu verbinden...")
-            asyncio.create_task(self.connect_obs_with_retry())
-            return False
-        return True
-    
-    def play_video(self, source_name):
-        """Video abspielen und anzeigen auf beiden OBS Instanzen"""
-        # Versuche auf beiden OBS Instanzen zu spielen, fehlgeschlagene sollten nicht andere blockieren
-        if self.obs:
             try:
-                self._play_video_on_obs(self.obs, source_name, 1)
+                obs_conn = obsws(config[host_key], config[port_key], config[pass_key])
+                obs_conn.connect()
+                setattr(self, obs_attr, obs_conn)
+                print(f"✓ Mit OBS {instance_num} verbunden ({config[host_key]}:{config[port_key]})")
+                return True
             except Exception as e:
-                print(f"✗ Fehler auf OBS 1: {e}")
-        else:
-            print("⚠ OBS 1 nicht verbunden")
-        
-        if self.obs2:
-            try:
-                self._play_video_on_obs(self.obs2, source_name, 2)
-            except Exception as e:
-                print(f"✗ Fehler auf OBS 2: {e}")
-        else:
-            print("⚠ OBS 2 nicht verbunden")
-        
-        if not self.obs and not self.obs2:
-            print("✗ Keine OBS Instanz verfügbar, Video kann nicht abgespielt werden")
+                retry_count += 1
+                print(f"⏳ OBS {instance_num} Wiederverbindung in {RETRY_DELAY} Sekunden... (Versuch {retry_count})")
+                print(f"   Fehler: {e}")
+                await asyncio.sleep(RETRY_DELAY)
     
-    def _play_video_on_obs(self, obs_instance, source_name, obs_num):
-        """Spiele Video auf einer bestimmten OBS Instanz ab"""
+    async def connect_obs_with_retry(self) -> bool:
+        """Connect to OBS instance 1 with retry logic.
+        
+        Returns:
+            True if connection successful
+        """
+        return await self._connect_obs_instance(1)
+    
+    async def connect_obs2_with_retry(self) -> bool:
+        """Connect to OBS instance 2 with retry logic.
+        
+        Returns:
+            True if connection successful
+        """
+        return await self._connect_obs_instance(2)
+    
+    async def connect_sos_with_retry(self) -> bool:
+        """Connect to SOS WebSocket server with retry logic.
+        
+        Attempts to connect to SOS WebSocket at configured host/port.
+        Automatically retries on failure with RETRY_DELAY between attempts.
+        
+        Returns:
+            True if connection successful
+        """
+        retry_count = 0
+        while True:
+            try:
+                self.sos_ws = await websockets.connect(f"ws://{config['SOS_HOST']}:{config['SOS_PORT']}")
+                print(f"✓ Mit SOS verbunden ({config['SOS_HOST']}:{config['SOS_PORT']})")
+                return True
+            except Exception as e:
+                retry_count += 1
+                print(f"⏳ SOS Wiederverbindung in {RETRY_DELAY} Sekunden... (Versuch {retry_count})")
+                print(f"   Fehler: {e}")
+                await asyncio.sleep(RETRY_DELAY)
+    
+    def _find_source_in_scene(self, obs_instance: obsws, scene_name: str, source_name: str, obs_num: int) -> int | None:
+        """Find scene item ID for a media source in an OBS scene.
+        
+        Args:
+            obs_instance: OBS WebSocket connection
+            scene_name: Name of the OBS scene to search in
+            source_name: Name of the media source to find
+            obs_num: OBS instance number (1 or 2) for logging
+        
+        Returns:
+            Scene item ID if found, None otherwise
+        """
         try:
-            # Nutze konfigurierte Scene oder aktuelle Scene
-            if config['WIN_SCENE_NAME']:
-                scene_name = config['WIN_SCENE_NAME']
-            else:
-                current_scene = obs_instance.call(obs_requests.GetCurrentProgramScene())
-                scene_name = current_scene.datain['currentProgramSceneName']
-            
-            # Finde Scene Item ID
             scene_items = obs_instance.call(obs_requests.GetSceneItemList(sceneName=scene_name))
-            scene_item_id = None
             for item in scene_items.datain['sceneItems']:
                 if item['sourceName'] == source_name:
-                    scene_item_id = item['sceneItemId']
-                    break
-            
+                    return item['sceneItemId']
+            print(f"✗ Source '{source_name}' nicht gefunden in Scene '{scene_name}' (OBS {obs_num})")
+            return None
+        except Exception as e:
+            print(f"✗ Fehler beim Suchen von '{source_name}' (OBS {obs_num}): {e}")
+            return None
+    
+    def _play_media_on_obs(self, obs_instance: obsws, scene_name: str, source_name: str, obs_num: int, delay: float = HIDE_VIDEO_DELAY) -> None:
+        """Play media source on OBS instance and hide after delay.
+        
+        Finds the media source in the scene, makes it visible, starts playback,
+        and schedules it to be hidden after the specified delay in a background thread.
+        
+        Args:
+            obs_instance: OBS WebSocket connection
+            scene_name: Name of the OBS scene containing the source
+            source_name: Name of the media source to play
+            obs_num: OBS instance number (1 or 2) for logging
+            delay: Seconds to wait before hiding the source (default: HIDE_VIDEO_DELAY)
+        
+        Raises:
+            Exception: Propagates OBS communication errors
+        """
+        try:
+            scene_item_id = self._find_source_in_scene(obs_instance, scene_name, source_name, obs_num)
             if scene_item_id is None:
-                print(f"✗ Source '{source_name}' nicht gefunden in OBS {obs_num}")
                 return
             
-            # Source sichtbar machen
             obs_instance.call(obs_requests.SetSceneItemEnabled(
                 sceneName=scene_name,
                 sceneItemId=scene_item_id,
                 sceneItemEnabled=True
             ))
-            print(f"✓ Source sichtbar gemacht (OBS {obs_num}): {source_name}")
             
-            # Video abspielen
             obs_instance.call(obs_requests.TriggerMediaInputAction(
                 inputName=source_name,
                 mediaAction="OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
             ))
-            print(f"▶ Video gestartet (OBS {obs_num}): {source_name}")
+            print(f"▶ Media gestartet (OBS {obs_num}): {source_name}")
             
-            # Source nach dem Video wieder unsichtbar machen (asynchron)
-            self.hide_video_later(obs_instance, scene_name, scene_item_id, source_name, obs_num)
-            
+            self._schedule_hide(obs_instance, scene_name, scene_item_id, source_name, obs_num, delay)
         except Exception as e:
             print(f"✗ Fehler beim Abspielen auf OBS {obs_num}: {e}")
-            raise
     
-    def hide_video_later(self, obs_instance, scene_name, scene_item_id, source_name, obs_num, delay=10):
-        """Verstecke Video nach Verzögerung in separatem Thread"""
-        def hide():
-            import time
+    def _schedule_hide(self, obs_instance: obsws, scene_name: str, scene_item_id: int, source_name: str, obs_num: int, delay: float) -> None:
+        """Schedule source to be hidden after delay in background thread.
+        
+        Starts a daemon thread that waits for the specified delay, then disables
+        the scene item to hide the source.
+        
+        Args:
+            obs_instance: OBS WebSocket connection
+            scene_name: Name of the OBS scene
+            scene_item_id: ID of the scene item to hide
+            source_name: Name of the source (for logging)
+            obs_num: OBS instance number (1 or 2) for logging
+            delay: Seconds to wait before hiding
+        """
+        def hide_after_delay():
             time.sleep(delay)
             try:
                 obs_instance.call(obs_requests.SetSceneItemEnabled(
@@ -226,61 +320,93 @@ class OBSSOSController:
                 ))
                 print(f"✓ Source versteckt (OBS {obs_num}): {source_name}")
             except Exception as e:
-                print(f"✗ Fehler beim Verstecken auf OBS {obs_num}: {e}")
+                print(f"✗ Fehler beim Verstecken (OBS {obs_num}): {e}")
         
-        hide_thread = threading.Thread(target=hide, daemon=True)
-        hide_thread.start()
+        threading.Thread(target=hide_after_delay, daemon=True).start()
     
-    def play_audio(self):
-        """Spiele Win Audio auf beiden OBS Instanzen ab"""
-        if not config['AUDIO_SCENE_NAME'] or not config['AUDIO_SOURCE_NAME']:
+    def play_video(self, source_name: str) -> None:
+        """Play victory video on both OBS instances.
+        
+        Plays the team-specific victory animation on both OBS instances
+        simultaneously and automatically hides it after HIDE_VIDEO_DELAY seconds.
+        Handles connection errors gracefully - failure on one instance doesn't
+        prevent playback on the other.
+        
+        Args:
+            source_name: Name of the video media source to play (e.g., 'WIN HSMW BLAU.mp4')
+        """
+        scene_name = config['WIN_SCENE_NAME']
+        if not scene_name:
+            print("✗ Win Video Scene nicht konfiguriert")
+            return
+        
+        for obs, obs_num in [(self.obs, 1), (self.obs2, 2)]:
+            if obs:
+                try:
+                    self._play_media_on_obs(obs, scene_name, source_name, obs_num, delay=HIDE_VIDEO_DELAY)
+                except Exception as e:
+                    print(f"✗ Fehler auf OBS {obs_num}: {e}")
+            else:
+                print(f"⚠ OBS {obs_num} nicht verbunden")
+    
+    def play_audio(self) -> None:
+        """Play victory audio stinger on both OBS instances.
+        
+        Plays the configured audio source on both OBS instances and automatically
+        hides it after HIDE_AUDIO_DELAY seconds. Typically used for sound effects
+        like a victory jingle or crowd reaction.
+        """
+        scene_name = config['AUDIO_SCENE_NAME']
+        source_name = config['AUDIO_SOURCE_NAME']
+        if not scene_name or not source_name:
             print("✗ Audio Scene oder Source nicht konfiguriert")
             return
         
-        # Versuche auf beiden OBS Instanzen zu spielen
-        if self.obs:
-            try:
-                self._play_audio_on_obs(self.obs, 1)
-            except Exception as e:
-                print(f"✗ Fehler beim Audio auf OBS 1: {e}")
+        for obs, obs_num in [(self.obs, 1), (self.obs2, 2)]:
+            if obs:
+                try:
+                    self._play_media_on_obs(obs, scene_name, source_name, obs_num, delay=HIDE_AUDIO_DELAY)
+                    print(f"♫ Audio gestartet (OBS {obs_num}): {source_name}")
+                except Exception as e:
+                    print(f"✗ Fehler beim Audio auf OBS {obs_num}: {e}")
+    
+    def play_matchup_video(self) -> None:
+        """Play matchup video on both OBS instances.
         
-        if self.obs2:
-            try:
-                self._play_audio_on_obs(self.obs2, 2)
-            except Exception as e:
-                print(f"✗ Fehler beim Audio auf OBS 2: {e}")
+        Plays the matchup animation showing the upcoming teams before the match starts.
+        Automatically hides the video after HIDE_MATCHUP_DELAY seconds (typically the
+        full length of the animation).
+        """
+        scene_name = config['MATCHUP_SCENE_NAME']
+        if not scene_name:
+            print("✗ Matchup Scene nicht konfiguriert")
+            return
+        
+        if not self.obs and not self.obs2:
+            print("✗ Keine OBS Instanz verfügbar")
+            return
+        
+        match_idx = config['CURRENT_MATCH']
+        match = config['MATCHES'][match_idx]
+        matchup_video = f"{match['blue_team']} vs {match['orange_team']}.mp4"
+        
+        for obs, obs_num in [(self.obs, 1), (self.obs2, 2)]:
+            if obs:
+                try:
+                    self._play_media_on_obs(obs, scene_name, matchup_video, obs_num, delay=HIDE_MATCHUP_DELAY)
+                    print(f"▶ Matchup Video gestartet (OBS {obs_num}): {matchup_video}")
+                except Exception as e:
+                    print(f"✗ Fehler beim Matchup auf OBS {obs_num}: {e}")
     
-    def _play_audio_on_obs(self, obs_instance, obs_num):
-        """Spiele Audio auf einer bestimmten OBS Instanz ab"""
-        try:
-            scene_name = config['AUDIO_SCENE_NAME']
-            source_name = config['AUDIO_SOURCE_NAME']
-            
-            # Finde Scene Item ID
-            scene_items = obs_instance.call(obs_requests.GetSceneItemList(sceneName=scene_name))
-            scene_item_id = None
-            for item in scene_items.datain['sceneItems']:
-                if item['sourceName'] == source_name:
-                    scene_item_id = item['sceneItemId']
-                    break
-            
-            if scene_item_id is None:
-                print(f"✗ Audio Source '{source_name}' nicht gefunden in Scene '{scene_name}' (OBS {obs_num})")
-                return
-            
-            # Audio abspielen
-            obs_instance.call(obs_requests.TriggerMediaInputAction(
-                inputName=source_name,
-                mediaAction="OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
-            ))
-            print(f"♫ Audio gestartet (OBS {obs_num}): {source_name}")
-            
-        except Exception as e:
-            print(f"✗ Fehler beim Abspielen des Audio auf OBS {obs_num}: {e}")
-            raise
-    
-    def handle_match_ended(self, winner_team_num):
-        """Match beendet - spiele Video und Audio ab"""
+    def handle_match_ended(self, winner_team_num: int) -> None:
+        """Handle a match end event from SOS.
+        
+        Triggered when a match ends, this plays the appropriate victory video
+        and audio for the winning team on both OBS instances.
+        
+        Args:
+            winner_team_num: Team number that won (0 for blue/cyan, 1 for orange/pink)
+        """
         match_idx = config['CURRENT_MATCH']
         match = config['MATCHES'][match_idx]
         
@@ -296,78 +422,13 @@ class OBSSOSController:
         # Spiele auch Audio ab
         self.play_audio()
     
-    def play_matchup_video(self):
-        """Spiele Matchup Video mit aktuellem Match auf beiden OBS Instanzen"""
-        if not config['MATCHUP_SCENE_NAME']:
-            print("✗ Matchup Scene nicht konfiguriert")
-            return
+    async def listen_sos_events(self) -> None:
+        """Listen for SOS WebSocket events with automatic reconnection.
         
-        if not self.obs and not self.obs2:
-            print("✗ Keine OBS Instanz verfügbar")
-            return
-        
-        match_idx = config['CURRENT_MATCH']
-        match = config['MATCHES'][match_idx]
-        blue_team = match['blue_team']
-        orange_team = match['orange_team']
-        
-        # Generiere Matchup Video Namen
-        matchup_video = f"{blue_team} vs {orange_team}.mp4"
-        
-        # Versuche auf beiden OBS Instanzen zu spielen
-        if self.obs:
-            try:
-                self._play_matchup_on_obs(self.obs, matchup_video, 1)
-            except Exception as e:
-                print(f"✗ Fehler beim Matchup auf OBS 1: {e}")
-        
-        if self.obs2:
-            try:
-                self._play_matchup_on_obs(self.obs2, matchup_video, 2)
-            except Exception as e:
-                print(f"✗ Fehler beim Matchup auf OBS 2: {e}")
-    
-    def _play_matchup_on_obs(self, obs_instance, matchup_video, obs_num):
-        """Spiele Matchup Video auf einer bestimmten OBS Instanz ab"""
-        try:
-            scene_name = config['MATCHUP_SCENE_NAME']
-            
-            # Finde Scene Item ID
-            scene_items = obs_instance.call(obs_requests.GetSceneItemList(sceneName=scene_name))
-            scene_item_id = None
-            for item in scene_items.datain['sceneItems']:
-                if item['sourceName'] == matchup_video:
-                    scene_item_id = item['sceneItemId']
-                    break
-            
-            if scene_item_id is None:
-                print(f"✗ Matchup Video '{matchup_video}' nicht gefunden in Scene '{scene_name}' (OBS {obs_num})")
-                return
-            
-            # Source sichtbar machen
-            obs_instance.call(obs_requests.SetSceneItemEnabled(
-                sceneName=scene_name,
-                sceneItemId=scene_item_id,
-                sceneItemEnabled=True
-            ))
-            print(f"✓ Matchup Source sichtbar (OBS {obs_num}): {matchup_video}")
-            
-            # Video abspielen
-            obs_instance.call(obs_requests.TriggerMediaInputAction(
-                inputName=matchup_video,
-                mediaAction="OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
-            ))
-            print(f"▶ Matchup Video gestartet (OBS {obs_num}): {matchup_video}")
-            
-            # Source nach 77 Sekunden wieder unsichtbar machen (asynchron)
-            self.hide_video_later(obs_instance, scene_name, scene_item_id, matchup_video, obs_num, delay=77)
-            
-        except Exception as e:
-            print(f"✗ Fehler beim Abspielen des Matchup Videos auf OBS {obs_num}: {e}")
-            raise
-    
-    async def listen_sos_events(self):
-        """Auf SOS Events lauschen mit automatischer Wiederverbindung"""
+        Continuously monitors the SOS connection for match end events.
+        On connection loss, automatically attempts to reconnect.
+        Handles deserialization of JSON events and triggers appropriate actions.
+        """
         while True:
             try:
                 async for message in self.sos_ws:
@@ -393,8 +454,13 @@ class OBSSOSController:
                 await asyncio.sleep(5)
                 await self.connect_sos_with_retry()
     
-    async def run(self):
-        """Hauptloop"""
+    async def run(self) -> None:
+        """Main async event loop.
+        
+        Initializes connections to both OBS instances and SOS WebSocket server.
+        Coordinates concurrent connection attempts and starts event listening.
+        Handles graceful shutdown when interrupted or on errors.
+        """
         print("=== OBS + SOS Video Player ===\n")
         
         # Connect to both OBS instances and SOS concurrently
@@ -431,7 +497,18 @@ class OBSSOSController:
                 await self.sos_ws.close()
 
 class ConfigGUI:
-    def __init__(self, root):
+    """Configuration GUI for OBS SOS Video Player.
+    
+    Provides a graphical interface for configuring OBS instances, SOS connection,
+    scene names, matches, and manual testing of video playback.
+    """
+    
+    def __init__(self, root: tk.Tk) -> None:
+        """Initialize configuration GUI.
+        
+        Args:
+            root: Tkinter root window
+        """
         self.root = root
         self.root.title("OBS SOS Video Player - Konfiguration")
         self.root.geometry("620x700")
@@ -469,92 +546,44 @@ class ConfigGUI:
         obs2_label.grid(row=1, column=2, columnspan=2, pady=(10, 5), sticky="w", padx=10)
         
         # OBS 1 Host
-        ttk.Label(main_frame, text="Host:").grid(row=2, column=0, sticky="w", padx=20, pady=5)
-        self.obs_host_input = ttk.Entry(main_frame, width=18)
-        self.obs_host_input.insert(0, config['OBS_HOST'])
-        self.obs_host_input.grid(row=2, column=1, padx=20, pady=5, sticky="w")
-        self.obs_host_input.bind('<KeyRelease>', self.update_config)
+        self.obs_host_input = self._create_config_field(main_frame, "Host:", 2, 0, config['OBS_HOST'])
         
         # OBS 2 Host
-        ttk.Label(main_frame, text="Host:").grid(row=2, column=2, sticky="w", padx=20, pady=5)
-        self.obs2_host_input = ttk.Entry(main_frame, width=18)
-        self.obs2_host_input.insert(0, config['OBS2_HOST'])
-        self.obs2_host_input.grid(row=2, column=3, padx=20, pady=5, sticky="w")
-        self.obs2_host_input.bind('<KeyRelease>', self.update_config)
+        self.obs2_host_input = self._create_config_field(main_frame, "Host:", 2, 2, config['OBS2_HOST'])
         
         # OBS 1 Port
-        ttk.Label(main_frame, text="Port:").grid(row=3, column=0, sticky="w", padx=20, pady=5)
-        self.obs_port_input = ttk.Entry(main_frame, width=18)
-        self.obs_port_input.insert(0, str(config['OBS_PORT']))
-        self.obs_port_input.grid(row=3, column=1, padx=20, pady=5, sticky="w")
-        self.obs_port_input.bind('<KeyRelease>', self.update_config)
+        self.obs_port_input = self._create_config_field(main_frame, "Port:", 3, 0, str(config['OBS_PORT']))
         
         # OBS 2 Port
-        ttk.Label(main_frame, text="Port:").grid(row=3, column=2, sticky="w", padx=20, pady=5)
-        self.obs2_port_input = ttk.Entry(main_frame, width=18)
-        self.obs2_port_input.insert(0, str(config['OBS2_PORT']))
-        self.obs2_port_input.grid(row=3, column=3, padx=20, pady=5, sticky="w")
-        self.obs2_port_input.bind('<KeyRelease>', self.update_config)
+        self.obs2_port_input = self._create_config_field(main_frame, "Port:", 3, 2, str(config['OBS2_PORT']))
         
         # OBS 1 Password
-        ttk.Label(main_frame, text="Password:").grid(row=4, column=0, sticky="w", padx=20, pady=5)
-        self.obs_password_input = ttk.Entry(main_frame, width=18, show="*")
-        self.obs_password_input.insert(0, config['OBS_PASSWORD'])
-        self.obs_password_input.grid(row=4, column=1, padx=20, pady=5, sticky="w")
-        self.obs_password_input.bind('<KeyRelease>', self.update_config)
+        self.obs_password_input = self._create_config_field(main_frame, "Password:", 4, 0, config['OBS_PASSWORD'], show="*")
         
         # OBS 2 Password
-        ttk.Label(main_frame, text="Password:").grid(row=4, column=2, sticky="w", padx=20, pady=5)
-        self.obs2_password_input = ttk.Entry(main_frame, width=18, show="*")
-        self.obs2_password_input.insert(0, config['OBS2_PASSWORD'])
-        self.obs2_password_input.grid(row=4, column=3, padx=20, pady=5, sticky="w")
-        self.obs2_password_input.bind('<KeyRelease>', self.update_config)
+        self.obs2_password_input = self._create_config_field(main_frame, "Password:", 4, 2, config['OBS2_PASSWORD'], show="*")
         
         # SOS Configuration Section
         sos_label = ttk.Label(main_frame, text="SOS WebSocket", font=("Arial", 11, "bold"), foreground="blue")
         sos_label.grid(row=5, column=2, columnspan=2, pady=(10, 5), sticky="w", padx=10)
         
         # SOS Host
-        ttk.Label(main_frame, text="Host:").grid(row=6, column=2, sticky="w", padx=20, pady=5)
-        self.sos_host_input = ttk.Entry(main_frame, width=18)
-        self.sos_host_input.insert(0, config['SOS_HOST'])
-        self.sos_host_input.grid(row=6, column=3, padx=20, pady=5, sticky="w")
-        self.sos_host_input.bind('<KeyRelease>', self.update_config)
+        self.sos_host_input = self._create_config_field(main_frame, "Host:", 6, 2, config['SOS_HOST'])
         
         # SOS Port
-        ttk.Label(main_frame, text="Port:").grid(row=7, column=2, sticky="w", padx=20, pady=5)
-        self.sos_port_input = ttk.Entry(main_frame, width=18)
-        self.sos_port_input.insert(0, str(config['SOS_PORT']))
-        self.sos_port_input.grid(row=7, column=3, padx=20, pady=5, sticky="w")
-        self.sos_port_input.bind('<KeyRelease>', self.update_config)
+        self.sos_port_input = self._create_config_field(main_frame, "Port:", 7, 2, str(config['SOS_PORT']))
         
-        # Winchamber Scene Name
-        ttk.Label(main_frame, text="Win Video Scene:").grid(row=5, column=0, sticky="w", padx=20, pady=5)
-        self.obs_scene_input = ttk.Entry(main_frame, width=18)
-        self.obs_scene_input.insert(0, config['WIN_SCENE_NAME'])
-        self.obs_scene_input.grid(row=5, column=1, padx=20, pady=5, sticky="w")
-        self.obs_scene_input.bind('<KeyRelease>', self.update_config)
+        # Win Video Scene Name
+        self.obs_scene_input = self._create_config_field(main_frame, "Win Video Scene:", 5, 0, config['WIN_SCENE_NAME'])
         
         # Matchup Scene Name
-        ttk.Label(main_frame, text="Matchup Scene:").grid(row=6, column=0, sticky="w", padx=20, pady=5)
-        self.matchup_scene_input = ttk.Entry(main_frame, width=18)
-        self.matchup_scene_input.insert(0, config['MATCHUP_SCENE_NAME'])
-        self.matchup_scene_input.grid(row=6, column=1, padx=20, pady=5, sticky="w")
-        self.matchup_scene_input.bind('<KeyRelease>', self.update_config)
+        self.matchup_scene_input = self._create_config_field(main_frame, "Matchup Scene:", 6, 0, config['MATCHUP_SCENE_NAME'])
         
         # Audio Scene Name
-        ttk.Label(main_frame, text="Audio Scene:").grid(row=7, column=0, sticky="w", padx=20, pady=5)
-        self.audio_scene_input = ttk.Entry(main_frame, width=18)
-        self.audio_scene_input.insert(0, config['AUDIO_SCENE_NAME'])
-        self.audio_scene_input.grid(row=7, column=1, padx=20, pady=5, sticky="w")
-        self.audio_scene_input.bind('<KeyRelease>', self.update_config)
+        self.audio_scene_input = self._create_config_field(main_frame, "Audio Scene:", 7, 0, config['AUDIO_SCENE_NAME'])
         
         # Audio Source Name
-        ttk.Label(main_frame, text="Audio Source:").grid(row=8, column=0, sticky="w", padx=20, pady=5)
-        self.audio_source_input = ttk.Entry(main_frame, width=18)
-        self.audio_source_input.insert(0, config['AUDIO_SOURCE_NAME'])
-        self.audio_source_input.grid(row=8, column=1, padx=20, pady=5, sticky="w")
-        self.audio_source_input.bind('<KeyRelease>', self.update_config)
+        self.audio_source_input = self._create_config_field(main_frame, "Audio Source:", 8, 0, config['AUDIO_SOURCE_NAME'])
         
         # Play Matchup Button
         self.play_matchup_btn = ttk.Button(main_frame, text="▶ Play Matchup", command=self.play_matchup)
@@ -614,8 +643,39 @@ class ConfigGUI:
                                        command=lambda idx=i: self.test_win(idx, 1))
             win_orange_btn.pack(side="left", padx=2)
     
-    def set_current_match(self, match_idx):
-        """Setze aktuelles Match"""
+    def _create_config_field(self, parent: ttk.Frame, label: str, row: int, column: int, default_value: str, show: str = "") -> ttk.Entry:
+        """Create a labeled configuration input field.
+        
+        Helper method to reduce repetitive field creation code in the GUI.
+        Creates a label and Entry widget in a grid layout, pre-fills with
+        default value, and binds change handler.
+        
+        Args:
+            parent: Parent frame to add the widgets to
+            label: Label text to display
+            row: Grid row number
+            column: Grid column number
+            default_value: Default value to insert into the Entry
+            show: Character to show in field (empty for text, "*" for passwords)
+        
+        Returns:
+            The created ttk.Entry widget
+        """
+        ttk.Label(parent, text=label).grid(row=row, column=column, sticky="w", padx=20, pady=5)
+        entry = ttk.Entry(parent, width=18, show=show)
+        entry.insert(0, default_value)
+        entry.grid(row=row, column=column + 1, padx=20, pady=5, sticky="w")
+        entry.bind('<KeyRelease>', self.update_config)
+        return entry
+    
+    def set_current_match(self, match_idx: int) -> None:
+        """Set the current match for manual testing.
+        
+        Deselects all other matches and saves the configuration.
+        
+        Args:
+            match_idx: Index of the match to set as current (0-6)
+        """
         # Deselect all other matches
         for i, var in enumerate(self.match_vars):
             if i != match_idx:
@@ -627,16 +687,29 @@ class ConfigGUI:
         save_config()
         print(f"🎯 Aktuelles Match geändert zu: Match {match_idx + 1}")
     
-    def update_match(self, match_idx, team_type):
-        """Update Match Teams"""
+    def update_match(self, match_idx: int, team_type: str) -> None:
+        """Update match teams from dropdown selections.
+        
+        Args:
+            match_idx: Index of the match (0-6)
+            team_type: Team to update ('blue' or 'orange')
+        """
         if team_type == 'blue':
             config['MATCHES'][match_idx]['blue_team'] = self.match_dropdowns_blue[match_idx].get()
         else:
             config['MATCHES'][match_idx]['orange_team'] = self.match_dropdowns_orange[match_idx].get()
         save_config()
     
-    def update_config(self, event=None):
-        """Aktualisiere Config in Echtzeit"""
+    def update_config(self, event=None) -> None:
+        """Update configuration in real-time as user types.
+        
+        Called on every KeyRelease event in any config field.
+        Updates the global config dict and persists to file.
+        Handles type conversion for port numbers gracefully.
+        
+        Args:
+            event: Tkinter event object (optional, ignored)
+        """
         config['OBS_HOST'] = self.obs_host_input.get()
         try:
             config['OBS_PORT'] = int(self.obs_port_input.get())
@@ -664,8 +737,16 @@ class ConfigGUI:
         
         save_config()
     
-    def test_win(self, match_idx, winner_team_num):
-        """Test Funktion um Sieg manuell zu triggern"""
+    def test_win(self, match_idx: int, winner_team_num: int) -> None:
+        """Manually trigger victory video for testing.
+        
+        Allows manual testing of victory videos and audio without waiting for
+        actual SOS events. Sets the match as current and simulates a match end.
+        
+        Args:
+            match_idx: Index of the match (0-6)
+            winner_team_num: Team number that won (0 for blue, 1 for orange)
+        """
         # Setze das Match als aktuell
         config['CURRENT_MATCH'] = match_idx
         
@@ -676,27 +757,48 @@ class ConfigGUI:
         else:
             print("✗ Controller nicht verfügbar")
     
-    def play_matchup(self):
-        """Rufe play_matchup_video im Controller auf"""
+    def play_matchup(self) -> None:
+        """Manually trigger matchup video for testing.
+        
+        Allows manual playback of the current matchup video animation
+        without waiting for automatic schedule.
+        """
         # Der Controller wird global gespeichert, daher können wir ihn hier zugreifen
         if hasattr(self, 'controller') and self.controller:
             self.controller.play_matchup_video()
         else:
             print("✗ Controller nicht verfügbar")
 
-def run_async_in_thread(loop, controller):
-    """Führe den Async Loop in einem Thread aus"""
+def run_async_in_thread(loop: asyncio.AbstractEventLoop, controller: OBSSOSController) -> None:
+    """Run async event loop in a dedicated thread.
+    
+    Args:
+        loop: The asyncio event loop to run
+        controller: The OBSSOSController instance to execute
+    """
     asyncio.set_event_loop(loop)
     loop.run_until_complete(controller.run())
 
-async def main():
+async def main() -> None:
+    """Alternative main entry point for direct async execution.
+    
+    Creates and runs the OBSSOSController directly without GUI.
+    """
     controller = OBSSOSController()
     await controller.run()
 
-# Global controller instance
-app_controller = None
+# Global controller instance shared between GUI and async loop
+app_controller: OBSSOSController | None = None
 
 if __name__ == "__main__":
+    """Application entry point.
+    
+    1. Loads configuration from file (or uses defaults)
+    2. Validates configuration
+    3. Creates GUI for configuration and manual controls
+    4. Starts OBSSOSController in background thread
+    5. Runs GUI main loop
+    """
     # Lade Config
     load_config()
     
