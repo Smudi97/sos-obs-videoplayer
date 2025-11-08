@@ -1,0 +1,49 @@
+{
+  "BLUE_TEAM": "HSMW",
+  "ORANGE_TEAM": "HSMW",
+  "OBS_HOST": "192.168.7.101",
+  "OBS_PORT": 4455,
+  "OBS_PASSWORD": "",
+  "WIN_SCENE_NAME": "Scene 3",
+  "MATCHUP_SCENE_NAME": "Scene 3",
+  "AUDIO_SCENE_NAME": "SCN Musik-Output",
+  "AUDIO_SOURCE_NAME": "MED Game Win Stinger Audio",
+  "OBS2_HOST": "localhost",
+  "OBS2_PORT": 4455,
+  "OBS2_PASSWORD": "",
+  "SOS_HOST": "localhost",
+  "SOS_PORT": 49122,
+  "COMPANION_WEBSOCKET_PORT": 55555,
+  "COMPANION_ENABLED": true,
+  "CURRENT_MATCH": 1,
+  "MATCHES": [
+    {
+      "blue_team": "HSMW",
+      "orange_team": "UIA B"
+    },
+    {
+      "blue_team": "WHZ",
+      "orange_team": "HSMW"
+    },
+    {
+      "blue_team": "LES",
+      "orange_team": "UIA B"
+    },
+    {
+      "blue_team": "TLU",
+      "orange_team": "UIA A"
+    },
+    {
+      "blue_team": "HSMW",
+      "orange_team": "LES"
+    },
+    {
+      "blue_team": "UIA A",
+      "orange_team": "WHZ"
+    },
+    {
+      "blue_team": "HSMW",
+      "orange_team": "HSMW"
+    }
+  ]
+}

@@ -43,5 +43,7 @@
       "blue_team": "HSMW",
       "orange_team": "HSMW"
     }
-  ]
+  ],
+  "COMPANION_WEBSOCKET_PORT": 55555,
+  "COMPANION_ENABLED": true
 }

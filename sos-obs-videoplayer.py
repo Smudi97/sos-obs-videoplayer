@@ -49,6 +49,7 @@ MAX_RETRY_ATTEMPTS = 0         # 0 = infinite retries
 # WebSocket and API constants
 OBS_WEBSOCKET_PORT = 4455      # Default OBS WebSocket port
 SOS_WEBSOCKET_PORT = 49322     # Default SOS WebSocket port
+COMPANION_WEBSOCKET_PORT = 55555  # Default Bitfocus Companion WebSocket port
 
 # Global Config - wird durch GUI aktualisiert
 config = {
@@ -66,10 +67,12 @@ config = {
     'OBS2_PASSWORD': "",
     'SOS_HOST': "localhost",
     'SOS_PORT': SOS_WEBSOCKET_PORT,
+    'COMPANION_WEBSOCKET_PORT': COMPANION_WEBSOCKET_PORT,  # WebSocket port for Bitfocus Companion
+    'COMPANION_ENABLED': True,          # Enable/disable Companion integration
     'CURRENT_MATCH': 0,  # 0-6 für Match 1-7
     'MATCHES': [
         {'blue_team': "HSMW", 'orange_team': "UIA B"},
-        {'blue_team': "WHZ", 'orange_team': "TLU"},
+        {'blue_team': "TLU", 'orange_team': "WHZ"},
         {'blue_team': "LES", 'orange_team': "UIA B"},
         {'blue_team': "TLU", 'orange_team': "UIA A"},
         {'blue_team': "HSMW", 'orange_team': "LES"},
@@ -454,14 +457,184 @@ class OBSSOSController:
                 await asyncio.sleep(5)
                 await self.connect_sos_with_retry()
     
+    async def start_companion_server(self) -> None:
+        """Start WebSocket server for Bitfocus Companion integration.
+        
+        Listens on localhost:COMPANION_WEBSOCKET_PORT for JSON commands
+        from Bitfocus Companion. Supported commands:
+        - {"command": "play_matchup"} - Triggers matchup video
+        - {"command": "play_video", "team": "HSMW", "color": "BLAU"} - Play team video
+        - {"command": "play_audio"} - Play audio stinger
+        - {"command": "trigger_win", "team_num": 0} - Simulate match end (0=blue, 1=orange)
+        """
+        port = config.get('COMPANION_WEBSOCKET_PORT', 8765)
+        
+        async def handler(websocket, path):
+            """Handle incoming Companion commands."""
+            print(f"✓ Companion connected from {websocket.remote_address}")
+            try:
+                async for message in websocket:
+                    try:
+                        command = json.loads(message)
+                        await self._handle_companion_command(command, websocket)
+                    except json.JSONDecodeError:
+                        await websocket.send(json.dumps({
+                            "status": "error",
+                            "message": "Invalid JSON"
+                        }))
+                    except Exception as e:
+                        print(f"✗ Error processing command: {e}")
+                        await websocket.send(json.dumps({
+                            "status": "error",
+                            "message": str(e)
+                        }))
+            except websockets.exceptions.ConnectionClosed:
+                print(f"⏹ Companion disconnected")
+            except Exception as e:
+                print(f"✗ Companion error: {e}")
+        
+        try:
+            server = await websockets.serve(handler, "localhost", port)
+            print(f"✓ Companion WebSocket server running on localhost:{port}")
+            await server.wait_closed()
+        except Exception as e:
+            print(f"✗ Failed to start Companion server: {e}")
+
+    async def _handle_companion_command(self, command: dict, websocket) -> None:
+        """Process command from Bitfocus Companion.
+        
+        Args:
+            command: Dictionary with "command" key and optional parameters
+            websocket: Connection to send response back to Companion
+        """
+        cmd = command.get("command", "").lower()
+        
+        try:
+            if cmd == "play_matchup":
+                self.play_matchup_video()
+                await websocket.send(json.dumps({
+                    "status": "success",
+                    "command": "play_matchup",
+                    "message": "Matchup video started"
+                }))
+            
+            elif cmd == "play_video":
+                team = command.get("team")
+                color = command.get("color")
+                if team and color:
+                    video_name = get_video_name(team, color)
+                    self.play_video(video_name)
+                    await websocket.send(json.dumps({
+                        "status": "success",
+                        "command": "play_video",
+                        "video": video_name
+                    }))
+                else:
+                    await websocket.send(json.dumps({
+                        "status": "error",
+                        "message": "Missing 'team' or 'color' parameter"
+                    }))
+            
+            elif cmd == "play_audio":
+                self.play_audio()
+                await websocket.send(json.dumps({
+                    "status": "success",
+                    "command": "play_audio",
+                    "message": "Audio started"
+                }))
+            
+            elif cmd == "trigger_win":
+                team_num = command.get("team_num")
+                if team_num is not None:
+                    self.handle_match_ended(team_num)
+                    team_name = "Blue/Cyan" if team_num == 0 else "Orange/Pink"
+                    await websocket.send(json.dumps({
+                        "status": "success",
+                        "command": "trigger_win",
+                        "team": team_name
+                    }))
+                else:
+                    await websocket.send(json.dumps({
+                        "status": "error",
+                        "message": "Missing 'team_num' parameter (0=blue, 1=orange)"
+                    }))
+            
+            elif cmd == "set_match":
+                match_idx = command.get("match_index")
+                if match_idx is not None and 0 <= match_idx < len(config['MATCHES']):
+                    config['CURRENT_MATCH'] = match_idx
+                    save_config()
+                    match = config['MATCHES'][match_idx]
+                    await websocket.send(json.dumps({
+                        "status": "success",
+                        "command": "set_match",
+                        "match_index": match_idx,
+                        "match_number": match_idx + 1,
+                        "blue_team": match['blue_team'],
+                        "orange_team": match['orange_team']
+                    }))
+                    print(f"📺 Companion set match to: Match {match_idx + 1} ({match['blue_team']} vs {match['orange_team']})")
+                else:
+                    await websocket.send(json.dumps({
+                        "status": "error",
+                        "message": f"Invalid 'match_index'. Must be between 0 and {len(config['MATCHES']) - 1}"
+                    }))
+            
+            elif cmd == "get_current_match":
+                match_idx = config['CURRENT_MATCH']
+                match = config['MATCHES'][match_idx]
+                await websocket.send(json.dumps({
+                    "status": "success",
+                    "command": "get_current_match",
+                    "match_index": match_idx,
+                    "match_number": match_idx + 1,
+                    "blue_team": match['blue_team'],
+                    "orange_team": match['orange_team']
+                }))
+            
+            elif cmd == "list_matches":
+                matches_list = [
+                    {
+                        "match_index": i,
+                        "match_number": i + 1,
+                        "blue_team": match['blue_team'],
+                        "orange_team": match['orange_team']
+                    }
+                    for i, match in enumerate(config['MATCHES'])
+                ]
+                await websocket.send(json.dumps({
+                    "status": "success",
+                    "command": "list_matches",
+                    "matches": matches_list,
+                    "current_match_index": config['CURRENT_MATCH']
+                }))
+            
+            else:
+                await websocket.send(json.dumps({
+                    "status": "error",
+                    "message": f"Unknown command: {cmd}. Valid commands: play_matchup, play_video, play_audio, trigger_win, set_match, get_current_match, list_matches"
+                }))
+        
+        except Exception as e:
+            await websocket.send(json.dumps({
+                "status": "error",
+                "message": str(e)
+            }))
+    
     async def run(self) -> None:
         """Main async event loop.
         
         Initializes connections to both OBS instances and SOS WebSocket server.
         Coordinates concurrent connection attempts and starts event listening.
+        Optionally starts Companion WebSocket server if enabled.
         Handles graceful shutdown when interrupted or on errors.
         """
         print("=== OBS + SOS Video Player ===\n")
+        
+        # Start Companion server if enabled
+        companion_task = None
+        if config.get('COMPANION_ENABLED', False):
+            companion_task = asyncio.create_task(self.start_companion_server())
         
         # Connect to both OBS instances and SOS concurrently
         obs_result, obs2_result, sos_result = await asyncio.gather(
@@ -489,6 +662,12 @@ class OBSSOSController:
         except KeyboardInterrupt:
             print("\n⏹ Beendet")
         finally:
+            if companion_task:
+                companion_task.cancel()
+                try:
+                    await companion_task
+                except asyncio.CancelledError:
+                    pass
             if self.obs:
                 self.obs.disconnect()
             if self.obs2:
