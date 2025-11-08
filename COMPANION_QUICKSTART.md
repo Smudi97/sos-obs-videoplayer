@@ -158,7 +158,7 @@ Change which match will be played when you use `play_matchup` or `trigger_win`:
   "match_number": 3,
   "blue_team": "LES",
   "orange_team": "UIA B"
-}
+}S
 ```
 
 ---

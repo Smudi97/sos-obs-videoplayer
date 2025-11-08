@@ -62,6 +62,9 @@ config = {
     'MATCHUP_SCENE_NAME': "SCN Matchup Animation",
     'AUDIO_SCENE_NAME': "SCN Musik-Output",
     'AUDIO_SOURCE_NAME': "MED Game Win Stinger Audio",
+    'GOAL_VIDEO_SCENE_NAME': "SCN Goal Video",
+    'GOAL_VIDEO_SOURCE_NAME': "MED Goal Video",
+    'GOAL_AUDIO_SOURCE_NAME': "MED Goal Audio",
     'OBS2_HOST': "localhost",
     'OBS2_PORT': OBS_WEBSOCKET_PORT,
     'OBS2_PASSWORD': "",
@@ -95,6 +98,23 @@ def get_video_name(team_kuerzel: str, color: str) -> str:
         Formatted video filename (e.g., 'WIN HSMW BLAU.mp4')
     """
     return f"WIN {team_kuerzel} {color}.mp4"
+
+def normalize_team_name(team_name: str) -> str:
+    """Normalize team name for matchup video lookup.
+    
+    Converts "UIA A" and "UIA B" to "UIA" for matchup videos.
+    This allows using a single matchup video for both UIA variants.
+    
+    Args:
+        team_name: Team name (e.g., 'HSMW', 'UIA A', 'UIA B')
+    
+    Returns:
+        Normalized team name (e.g., 'HSMW', 'UIA', 'UIA')
+    """
+    # Remove " A" or " B" suffix if present (for UIA variants)
+    if team_name.startswith("UIA"):
+        return "UIA"
+    return team_name
 
 def save_config() -> None:
     """Persist current configuration to JSON file.
@@ -166,6 +186,8 @@ class OBSSOSController:
         self.obs: obsws | None = None           # OBS instance 1 connection
         self.obs2: obsws | None = None          # OBS instance 2 connection
         self.sos_ws: websockets.WebSocketClientProtocol | None = None  # SOS connection
+        self.obs_reconnect_task: asyncio.Task | None = None  # Task for OBS 1 reconnection monitoring
+        self.obs2_reconnect_task: asyncio.Task | None = None  # Task for OBS 2 reconnection monitoring
     
     async def _connect_obs_instance(self, instance_num: int) -> bool:
         """Connect to OBS instance (1 or 2) with retry logic.
@@ -237,6 +259,57 @@ class OBSSOSController:
                 retry_count += 1
                 print(f"⏳ SOS Wiederverbindung in {RETRY_DELAY} Sekunden... (Versuch {retry_count})")
                 print(f"   Fehler: {e}")
+                await asyncio.sleep(RETRY_DELAY)
+    
+    def _is_obs_connected(self, obs_instance: obsws | None, obs_num: int) -> bool:
+        """Check if OBS instance connection is still alive.
+        
+        Sends a ping-like request to verify the connection is active.
+        
+        Args:
+            obs_instance: OBS WebSocket connection to check
+            obs_num: OBS instance number (1 or 2) for logging
+        
+        Returns:
+            True if connection is alive, False otherwise
+        """
+        if obs_instance is None:
+            return False
+        
+        try:
+            # Try to get version info as a heartbeat check
+            obs_instance.call(obs_requests.GetVersion())
+            return True
+        except Exception as e:
+            print(f"✗ OBS {obs_num} Verbindung verloren: {e}")
+            return False
+    
+    async def _monitor_obs_connection(self, instance_num: int) -> None:
+        """Monitor and reconnect OBS instance if connection is lost.
+        
+        Periodically checks if the OBS connection is still alive.
+        If connection is lost, automatically attempts to reconnect.
+        
+        Args:
+            instance_num: OBS instance number (1 or 2)
+        """
+        while True:
+            try:
+                await asyncio.sleep(RETRY_DELAY)
+                
+                obs_instance = self.obs if instance_num == 1 else self.obs2
+                
+                # Check if connection is still alive
+                if obs_instance is not None and not self._is_obs_connected(obs_instance, instance_num):
+                    print(f"⏳ OBS {instance_num} Verbindung unterbrochen - Wiederverbindung...")
+                    
+                    # Try to reconnect
+                    await self._connect_obs_instance(instance_num)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"✗ Fehler bei OBS {instance_num} Monitoring: {e}")
                 await asyncio.sleep(RETRY_DELAY)
     
     def _find_source_in_scene(self, obs_instance: obsws, scene_name: str, source_name: str, obs_num: int) -> int | None:
@@ -373,12 +446,56 @@ class OBSSOSController:
                 except Exception as e:
                     print(f"✗ Fehler beim Audio auf OBS {obs_num}: {e}")
     
+    def play_goal_video(self) -> None:
+        """Play goal video on both OBS instances.
+        
+        Plays the configured goal video source on both OBS instances and automatically
+        hides it after HIDE_VIDEO_DELAY seconds. Triggered when a goal is scored.
+        """
+        scene_name = config['GOAL_VIDEO_SCENE_NAME']
+        source_name = config['GOAL_VIDEO_SOURCE_NAME']
+        if not scene_name or not source_name:
+            print("✗ Goal Video Scene oder Source nicht konfiguriert")
+            return
+        
+        for obs, obs_num in [(self.obs, 1), (self.obs2, 2)]:
+            if obs:
+                try:
+                    self._play_media_on_obs(obs, scene_name, source_name, obs_num, delay=HIDE_VIDEO_DELAY)
+                    print(f"⚽ Goal Video gestartet (OBS {obs_num}): {source_name}")
+                except Exception as e:
+                    print(f"✗ Fehler beim Goal Video auf OBS {obs_num}: {e}")
+    
+    def play_goal_audio(self) -> None:
+        """Play goal audio on both OBS instances.
+        
+        Plays the configured goal audio source on both OBS instances and automatically
+        hides it after HIDE_AUDIO_DELAY seconds. Triggered when a goal is scored.
+        Uses the same scene as the victory audio (AUDIO_SCENE_NAME).
+        """
+        scene_name = config['AUDIO_SCENE_NAME']
+        source_name = config['GOAL_AUDIO_SOURCE_NAME']
+        if not scene_name or not source_name:
+            print("✗ Goal Audio Source nicht konfiguriert")
+            return
+        
+        for obs, obs_num in [(self.obs, 1), (self.obs2, 2)]:
+            if obs:
+                try:
+                    self._play_media_on_obs(obs, scene_name, source_name, obs_num, delay=HIDE_AUDIO_DELAY)
+                    print(f"⚽ Goal Audio gestartet (OBS {obs_num}): {source_name}")
+                except Exception as e:
+                    print(f"✗ Fehler beim Goal Audio auf OBS {obs_num}: {e}")
+    
     def play_matchup_video(self) -> None:
         """Play matchup video on both OBS instances.
         
         Plays the matchup animation showing the upcoming teams before the match starts.
         Automatically hides the video after HIDE_MATCHUP_DELAY seconds (typically the
         full length of the animation).
+        
+        Note: Team names are normalized (e.g., "UIA A" and "UIA B" both use "UIA" video)
+        to allow using a single matchup video for all variants.
         """
         scene_name = config['MATCHUP_SCENE_NAME']
         if not scene_name:
@@ -391,7 +508,11 @@ class OBSSOSController:
         
         match_idx = config['CURRENT_MATCH']
         match = config['MATCHES'][match_idx]
-        matchup_video = f"{match['blue_team']} vs {match['orange_team']}.mp4"
+        
+        # Normalize team names for matchup video lookup
+        blue_normalized = normalize_team_name(match['blue_team'])
+        orange_normalized = normalize_team_name(match['orange_team'])
+        matchup_video = f"{blue_normalized} vs {orange_normalized}.mp4"
         
         for obs, obs_num in [(self.obs, 1), (self.obs2, 2)]:
             if obs:
@@ -400,6 +521,39 @@ class OBSSOSController:
                     print(f"▶ Matchup Video gestartet (OBS {obs_num}): {matchup_video}")
                 except Exception as e:
                     print(f"✗ Fehler beim Matchup auf OBS {obs_num}: {e}")
+    
+    def hide_matchup_video(self) -> None:
+        """Instantly hide matchup video on both OBS instances.
+        
+        Finds and disables all scene items in the matchup scene on both OBS instances.
+        This provides instant control to stop the matchup video without waiting for
+        the automatic hide timer.
+        """
+        scene_name = config['MATCHUP_SCENE_NAME']
+        if not scene_name:
+            print("✗ Matchup Scene nicht konfiguriert")
+            return
+        
+        if not self.obs and not self.obs2:
+            print("✗ Keine OBS Instanz verfügbar")
+            return
+        
+        for obs, obs_num in [(self.obs, 1), (self.obs2, 2)]:
+            if obs:
+                try:
+                    scene_items = obs.call(obs_requests.GetSceneItemList(sceneName=scene_name))
+                    if scene_items and scene_items.datain and 'sceneItems' in scene_items.datain:
+                        for item in scene_items.datain['sceneItems']:
+                            obs.call(obs_requests.SetSceneItemEnabled(
+                                sceneName=scene_name,
+                                sceneItemId=item['sceneItemId'],
+                                sceneItemEnabled=False
+                            ))
+                        print(f"✓ Matchup Video versteckt (OBS {obs_num}): {len(scene_items.datain['sceneItems'])} items disabled")
+                    else:
+                        print(f"ℹ Keine Items in Matchup Scene gefunden (OBS {obs_num})")
+                except Exception as e:
+                    print(f"✗ Fehler beim Verstecken des Matchup Videos (OBS {obs_num}): {e}")
     
     def handle_match_ended(self, winner_team_num: int) -> None:
         """Handle a match end event from SOS.
@@ -425,6 +579,16 @@ class OBSSOSController:
         # Spiele auch Audio ab
         self.play_audio()
     
+    def handle_goal_scored(self) -> None:
+        """Handle a goal scored event from SOS.
+        
+        Triggered when a goal is scored, this plays the goal video and audio
+        on both OBS instances simultaneously.
+        """
+        print("⚽ GOAL SCORED!")
+        self.play_goal_video()
+        self.play_goal_audio()
+    
     async def listen_sos_events(self) -> None:
         """Listen for SOS WebSocket events with automatic reconnection.
         
@@ -448,6 +612,9 @@ class OBSSOSController:
                             self.handle_match_ended(winner_team_num)
                         else:
                             print("✗ Kein winner_team_num gefunden!")
+
+                    if event == 'game:goal_scored':
+                        self.handle_goal_scored()
                         
             except websockets.exceptions.ConnectionClosed:
                 print("✗ SOS Verbindung geschlossen - Wiederverbindung wird versucht...")
@@ -609,10 +776,18 @@ class OBSSOSController:
                     "current_match_index": config['CURRENT_MATCH']
                 }))
             
+            elif cmd == "hide_matchup":
+                self.hide_matchup_video()
+                await websocket.send(json.dumps({
+                    "status": "success",
+                    "command": "hide_matchup",
+                    "message": "Matchup video hidden on all OBS instances"
+                }))
+            
             else:
                 await websocket.send(json.dumps({
                     "status": "error",
-                    "message": f"Unknown command: {cmd}. Valid commands: play_matchup, play_video, play_audio, trigger_win, set_match, get_current_match, list_matches"
+                    "message": f"Unknown command: {cmd}. Valid commands: play_matchup, play_video, play_audio, trigger_win, set_match, get_current_match, list_matches, hide_matchup"
                 }))
         
         except Exception as e:
@@ -657,11 +832,30 @@ class OBSSOSController:
         
         print("🎯 Bereit!\n")
         
+        # Start OBS connection monitoring tasks
+        if self.obs:
+            self.obs_reconnect_task = asyncio.create_task(self._monitor_obs_connection(1))
+        if self.obs2:
+            self.obs2_reconnect_task = asyncio.create_task(self._monitor_obs_connection(2))
+        
         try:
             await self.listen_sos_events()
         except KeyboardInterrupt:
             print("\n⏹ Beendet")
         finally:
+            # Cancel all monitoring tasks
+            if self.obs_reconnect_task:
+                self.obs_reconnect_task.cancel()
+                try:
+                    await self.obs_reconnect_task
+                except asyncio.CancelledError:
+                    pass
+            if self.obs2_reconnect_task:
+                self.obs2_reconnect_task.cancel()
+                try:
+                    await self.obs2_reconnect_task
+                except asyncio.CancelledError:
+                    pass
             if companion_task:
                 companion_task.cancel()
                 try:
@@ -762,21 +956,34 @@ class ConfigGUI:
         self.audio_scene_input = self._create_config_field(main_frame, "Audio Scene:", 7, 0, config['AUDIO_SCENE_NAME'])
         
         # Audio Source Name
-        self.audio_source_input = self._create_config_field(main_frame, "Audio Source:", 8, 0, config['AUDIO_SOURCE_NAME'])
+        self.audio_source_input = self._create_config_field(main_frame, "Win Audio Source:", 8, 0, config['AUDIO_SOURCE_NAME'])
+        
+        # Goal Video Scene Name
+        self.goal_video_scene_input = self._create_config_field(main_frame, "Goal Video Scene:", 9, 0, config['GOAL_VIDEO_SCENE_NAME'])
+        
+        # Goal Video Source Name
+        self.goal_video_source_input = self._create_config_field(main_frame, "Goal Video Source:", 10, 0, config['GOAL_VIDEO_SOURCE_NAME'])
+        
+        # Goal Audio Source Name
+        self.goal_audio_source_input = self._create_config_field(main_frame, "Goal Audio Source:", 11, 0, config['GOAL_AUDIO_SOURCE_NAME'])
         
         # Play Matchup Button
         self.play_matchup_btn = ttk.Button(main_frame, text="▶ Play Matchup", command=self.play_matchup)
-        self.play_matchup_btn.grid(row=9, column=0, columnspan=2, padx=20, pady=5, sticky="w")
+        self.play_matchup_btn.grid(row=9, column=2, columnspan=2, padx=20, pady=5, sticky="w")
+        
+        # Hide Matchup Button
+        self.hide_matchup_btn = ttk.Button(main_frame, text="✕ Hide Matchup", command=self.hide_matchup)
+        self.hide_matchup_btn.grid(row=10, column=2, columnspan=2, padx=20, pady=5, sticky="w")
         
         # Matches Section
         matches_label = ttk.Label(main_frame, text="Matches", font=("Arial", 11, "bold"), foreground="blue")
-        matches_label.grid(row=10, column=0, columnspan=4, pady=(15, 10), sticky="w", padx=10)
+        matches_label.grid(row=12, column=0, columnspan=4, pady=(15, 10), sticky="w", padx=10)
         
         # Column headers
-        ttk.Label(main_frame, text="Match", font=("Arial", 9, "bold")).grid(row=11, column=0, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Cyan Team", font=("Arial", 9, "bold")).grid(row=11, column=1, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Pink Team", font=("Arial", 9, "bold")).grid(row=11, column=2, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Test", font=("Arial", 9, "bold")).grid(row=11, column=3, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Match", font=("Arial", 9, "bold")).grid(row=13, column=0, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Cyan Team", font=("Arial", 9, "bold")).grid(row=13, column=1, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Pink Team", font=("Arial", 9, "bold")).grid(row=13, column=2, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Test", font=("Arial", 9, "bold")).grid(row=13, column=3, padx=10, pady=5, sticky="w")
         
         self.match_vars = []
         self.match_dropdowns_blue = []
@@ -784,7 +991,7 @@ class ConfigGUI:
         
         # Create 7 matches
         for i in range(7):
-            row = 12 + i
+            row = 14 + i
             
             # Current Match Checkbox
             var = tk.BooleanVar(value=(i == config['CURRENT_MATCH']))
@@ -908,6 +1115,10 @@ class ConfigGUI:
         config['AUDIO_SCENE_NAME'] = self.audio_scene_input.get()
         config['AUDIO_SOURCE_NAME'] = self.audio_source_input.get()
         
+        config['GOAL_VIDEO_SCENE_NAME'] = self.goal_video_scene_input.get()
+        config['GOAL_VIDEO_SOURCE_NAME'] = self.goal_video_source_input.get()
+        config['GOAL_AUDIO_SOURCE_NAME'] = self.goal_audio_source_input.get()
+        
         config['SOS_HOST'] = self.sos_host_input.get()
         try:
             config['SOS_PORT'] = int(self.sos_port_input.get())
@@ -945,6 +1156,17 @@ class ConfigGUI:
         # Der Controller wird global gespeichert, daher können wir ihn hier zugreifen
         if hasattr(self, 'controller') and self.controller:
             self.controller.play_matchup_video()
+        else:
+            print("✗ Controller nicht verfügbar")
+    
+    def hide_matchup(self) -> None:
+        """Manually hide matchup video on all OBS instances.
+        
+        Instantly hides the matchup video without waiting for the automatic timer.
+        Useful for manual control when you need to stop playback immediately.
+        """
+        if hasattr(self, 'controller') and self.controller:
+            self.controller.hide_matchup_video()
         else:
             print("✗ Controller nicht verfügbar")
 
