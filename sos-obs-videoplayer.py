@@ -23,6 +23,8 @@ config = {
     'OBS_PASSWORD': "",
     'OBS_SCENE_NAME': "",
     'MATCHUP_SCENE_NAME': "",
+    'SOS_HOST': "localhost",
+    'SOS_PORT': 49122,
     'CURRENT_MATCH': 0,  # 0-6 für Match 1-7
     'MATCHES': [
         {'blue_team': "HSMW", 'orange_team': "UIA"},
@@ -71,8 +73,8 @@ class OBSSOSController:
     async def connect_sos(self):
         """Verbindung zu SOS WebSocket herstellen"""
         try:
-            self.sos_ws = await websockets.connect(f"ws://{SOS_HOST}:{SOS_PORT}")
-            print(f"✓ Mit SOS verbunden")
+            self.sos_ws = await websockets.connect(f"ws://{config['SOS_HOST']}:{config['SOS_PORT']}")
+            print(f"✓ Mit SOS verbunden ({config['SOS_HOST']}:{config['SOS_PORT']})")
             return True
         except Exception as e:
             print(f"✗ SOS Fehler: {e}")
@@ -260,11 +262,16 @@ class OBSSOSController:
         """Hauptloop"""
         print("=== OBS + SOS Video Player ===\n")
         
-        if not await self.connect_obs_with_retry():
-            return
+        # Connect to both OBS and SOS concurrently
+        obs_result, sos_result = await asyncio.gather(
+            self.connect_obs_with_retry(),
+            self.connect_sos_with_retry(),
+            return_exceptions=False
+        )
         
-        if not await self.connect_sos_with_retry():
-            self.obs.disconnect()
+        if not obs_result or not sos_result:
+            if self.obs:
+                self.obs.disconnect()
             return
         
         print("🎯 Bereit!\n")
@@ -283,7 +290,7 @@ class ConfigGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("OBS SOS Video Player - Konfiguration")
-        self.root.geometry("700x650")
+        self.root.geometry("620x580")
         self.root.resizable(True, True)
         
         # Create Canvas with Scrollbar
@@ -307,59 +314,77 @@ class ConfigGUI:
         
         # Title
         title = ttk.Label(main_frame, text="Konfiguration", font=("Arial", 14, "bold"))
-        title.grid(row=0, column=0, columnspan=3, pady=10, sticky="w", padx=10)
+        title.grid(row=0, column=0, columnspan=4, pady=10, sticky="w", padx=10)
         
         # OBS Configuration Section
         obs_label = ttk.Label(main_frame, text="OBS WebSocket", font=("Arial", 11, "bold"), foreground="blue")
-        obs_label.grid(row=1, column=0, columnspan=3, pady=(10, 5), sticky="w", padx=10)
+        obs_label.grid(row=1, column=0, columnspan=2, pady=(10, 5), sticky="w", padx=10)
+        
+        # SOS Configuration Section
+        sos_label = ttk.Label(main_frame, text="SOS WebSocket", font=("Arial", 11, "bold"), foreground="blue")
+        sos_label.grid(row=1, column=2, columnspan=2, pady=(10, 5), sticky="w", padx=10)
         
         # OBS Host
         ttk.Label(main_frame, text="Host:").grid(row=2, column=0, sticky="w", padx=20, pady=5)
-        self.obs_host_input = ttk.Entry(main_frame, width=25)
+        self.obs_host_input = ttk.Entry(main_frame, width=20)
         self.obs_host_input.insert(0, config['OBS_HOST'])
         self.obs_host_input.grid(row=2, column=1, padx=20, pady=5, sticky="w")
         self.obs_host_input.bind('<KeyRelease>', self.update_config)
         
+        # SOS Host
+        ttk.Label(main_frame, text="Host:").grid(row=2, column=2, sticky="w", padx=20, pady=5)
+        self.sos_host_input = ttk.Entry(main_frame, width=20)
+        self.sos_host_input.insert(0, config['SOS_HOST'])
+        self.sos_host_input.grid(row=2, column=3, padx=20, pady=5, sticky="w")
+        self.sos_host_input.bind('<KeyRelease>', self.update_config)
+        
         # OBS Port
         ttk.Label(main_frame, text="Port:").grid(row=3, column=0, sticky="w", padx=20, pady=5)
-        self.obs_port_input = ttk.Entry(main_frame, width=25)
+        self.obs_port_input = ttk.Entry(main_frame, width=20)
         self.obs_port_input.insert(0, str(config['OBS_PORT']))
         self.obs_port_input.grid(row=3, column=1, padx=20, pady=5, sticky="w")
         self.obs_port_input.bind('<KeyRelease>', self.update_config)
         
+        # SOS Port
+        ttk.Label(main_frame, text="Port:").grid(row=3, column=2, sticky="w", padx=20, pady=5)
+        self.sos_port_input = ttk.Entry(main_frame, width=20)
+        self.sos_port_input.insert(0, str(config['SOS_PORT']))
+        self.sos_port_input.grid(row=3, column=3, padx=20, pady=5, sticky="w")
+        self.sos_port_input.bind('<KeyRelease>', self.update_config)
+        
         # OBS Password
         ttk.Label(main_frame, text="Password:").grid(row=4, column=0, sticky="w", padx=20, pady=5)
-        self.obs_password_input = ttk.Entry(main_frame, width=25, show="*")
+        self.obs_password_input = ttk.Entry(main_frame, width=20, show="*")
         self.obs_password_input.insert(0, config['OBS_PASSWORD'])
         self.obs_password_input.grid(row=4, column=1, padx=20, pady=5, sticky="w")
         self.obs_password_input.bind('<KeyRelease>', self.update_config)
         
         # OBS Scene Name
         ttk.Label(main_frame, text="Scene Name:").grid(row=5, column=0, sticky="w", padx=20, pady=5)
-        self.obs_scene_input = ttk.Entry(main_frame, width=25)
+        self.obs_scene_input = ttk.Entry(main_frame, width=20)
         self.obs_scene_input.insert(0, config['OBS_SCENE_NAME'])
         self.obs_scene_input.grid(row=5, column=1, padx=20, pady=5, sticky="w")
         self.obs_scene_input.bind('<KeyRelease>', self.update_config)
         
         # Matchup Scene Name
-        ttk.Label(main_frame, text="Matchup Scene:").grid(row=5, column=2, sticky="w", padx=20, pady=5)
-        self.matchup_scene_input = ttk.Entry(main_frame, width=25)
+        ttk.Label(main_frame, text="Matchup Scene:").grid(row=6, column=0, sticky="w", padx=20, pady=5)
+        self.matchup_scene_input = ttk.Entry(main_frame, width=20)
         self.matchup_scene_input.insert(0, config['MATCHUP_SCENE_NAME'])
-        self.matchup_scene_input.grid(row=6, column=2, padx=20, pady=5, sticky="w")
+        self.matchup_scene_input.grid(row=6, column=1, padx=20, pady=5, sticky="w")
         self.matchup_scene_input.bind('<KeyRelease>', self.update_config)
         
         # Play Matchup Button
         self.play_matchup_btn = ttk.Button(main_frame, text="▶ Play Matchup", command=self.play_matchup)
-        self.play_matchup_btn.grid(row=7, column=2, padx=20, pady=5, sticky="w")
+        self.play_matchup_btn.grid(row=7, column=0, columnspan=2, padx=20, pady=5, sticky="w")
         
         # Matches Section
         matches_label = ttk.Label(main_frame, text="Matches", font=("Arial", 11, "bold"), foreground="blue")
-        matches_label.grid(row=8, column=0, columnspan=3, pady=(15, 10), sticky="w", padx=10)
+        matches_label.grid(row=8, column=0, columnspan=4, pady=(15, 10), sticky="w", padx=10)
         
         # Column headers
         ttk.Label(main_frame, text="Match", font=("Arial", 9, "bold")).grid(row=9, column=0, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Blue Team", font=("Arial", 9, "bold")).grid(row=9, column=1, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Orange Team", font=("Arial", 9, "bold")).grid(row=9, column=2, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Cyan Team", font=("Arial", 9, "bold")).grid(row=9, column=1, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Pink Team", font=("Arial", 9, "bold")).grid(row=9, column=2, padx=10, pady=5, sticky="w")
         
         self.match_vars = []
         self.match_dropdowns_blue = []
@@ -390,11 +415,6 @@ class ConfigGUI:
             orange_dropdown.grid(row=row, column=2, padx=10, pady=5, sticky="w")
             orange_dropdown.bind('<<ComboboxSelected>>', lambda e, idx=i: self.update_match(idx, 'orange'))
             self.match_dropdowns_orange.append(orange_dropdown)
-        
-        # Status Label
-        row = 17
-        self.status_label = ttk.Label(main_frame, text="🟢 Läuft", font=("Arial", 10), foreground="green")
-        self.status_label.grid(row=row, column=0, columnspan=3, pady=20)
     
     def set_current_match(self, match_idx):
         """Setze aktuelles Match"""
@@ -425,6 +445,12 @@ class ConfigGUI:
         config['OBS_PASSWORD'] = self.obs_password_input.get()
         config['OBS_SCENE_NAME'] = self.obs_scene_input.get()
         config['MATCHUP_SCENE_NAME'] = self.matchup_scene_input.get()
+        
+        config['SOS_HOST'] = self.sos_host_input.get()
+        try:
+            config['SOS_PORT'] = int(self.sos_port_input.get())
+        except ValueError:
+            pass
     
     def play_matchup(self):
         """Rufe play_matchup_video im Controller auf"""
