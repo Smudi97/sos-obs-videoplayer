@@ -39,7 +39,7 @@ CONFIG_FILE = "config.json"
 
 # Delay constants (in seconds) for hiding media sources after playback
 HIDE_VIDEO_DELAY = 10          # Time to keep victory video visible
-HIDE_MATCHUP_DELAY = 77        # Time to keep matchup video visible (full duration)
+HIDE_MATCHUP_DELAY = 70        # Time to keep matchup video visible (full duration)
 HIDE_AUDIO_DELAY = 5           # Time to keep audio playing before hiding source
 
 # Connection retry settings
@@ -62,6 +62,8 @@ config = {
     'MATCHUP_SCENE_NAME': "SCN Matchup Animation",
     'AUDIO_SCENE_NAME': "SCN Musik-Output",
     'AUDIO_SOURCE_NAME': "MED Game Win Stinger Audio",
+    'MATCHUP_AUDIO_SOURCE_NAME': "MED Matchup Audio",
+    'MATCHUP_AUDIO_FINALE_SOURCE_NAME': "MED Matchup Audio Finale",
     'GOAL_VIDEO_SCENE_NAME': "SCN Goal Video",
     'GOAL_VIDEO_SOURCE_NAME': "MED Goal Video",
     'GOAL_AUDIO_SOURCE_NAME': "MED Goal Audio",
@@ -488,9 +490,10 @@ class OBSSOSController:
                     print(f"✗ Fehler beim Goal Audio auf OBS {obs_num}: {e}")
     
     def play_matchup_video(self) -> None:
-        """Play matchup video on both OBS instances.
+        """Play matchup video and audio on both OBS instances.
         
-        Plays the matchup animation showing the upcoming teams before the match starts.
+        Plays the matchup animation showing the upcoming teams before the match starts,
+        along with the appropriate audio (finale version for Match 7, regular otherwise).
         Automatically hides the video after HIDE_MATCHUP_DELAY seconds (typically the
         full length of the animation).
         
@@ -514,11 +517,26 @@ class OBSSOSController:
         orange_normalized = normalize_team_name(match['orange_team'])
         matchup_video = f"{blue_normalized} vs {orange_normalized}.mp4"
         
+        # Determine which audio to play (finale for Match 7, regular for others)
+        is_match_7 = (match_idx == 6)  # Match 7 is index 6
+        audio_source = config['MATCHUP_AUDIO_FINALE_SOURCE_NAME'] if is_match_7 else config['MATCHUP_AUDIO_SOURCE_NAME']
+        audio_scene = config['AUDIO_SCENE_NAME']
+        
         for obs, obs_num in [(self.obs, 1), (self.obs2, 2)]:
             if obs:
                 try:
+                    # Play the video
                     self._play_media_on_obs(obs, scene_name, matchup_video, obs_num, delay=HIDE_MATCHUP_DELAY)
                     print(f"▶ Matchup Video gestartet (OBS {obs_num}): {matchup_video}")
+                    
+                    # Play the appropriate audio
+                    if audio_source and audio_scene:
+                        try:
+                            self._play_media_on_obs(obs, audio_scene, audio_source, obs_num, delay=HIDE_AUDIO_DELAY)
+                            audio_type = "Finale" if is_match_7 else "Regular"
+                            print(f"🔊 Matchup Audio ({audio_type}) gestartet (OBS {obs_num}): {audio_source}")
+                        except Exception as e:
+                            print(f"✗ Fehler beim Matchup Audio auf OBS {obs_num}: {e}")
                 except Exception as e:
                     print(f"✗ Fehler beim Matchup auf OBS {obs_num}: {e}")
     
@@ -887,6 +905,9 @@ class ConfigGUI:
         self.root.geometry("620x700")
         self.root.resizable(True, True)
         
+        # Track config section collapse state
+        self.config_collapsed = False
+        
         # Create Canvas with Scrollbar
         canvas = tk.Canvas(root)
         scrollbar = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
@@ -906,84 +927,101 @@ class ConfigGUI:
         
         main_frame = scrollable_frame
         
-        # Title
-        title = ttk.Label(main_frame, text="Konfiguration", font=("Arial", 14, "bold"))
-        title.grid(row=0, column=0, columnspan=6, pady=10, sticky="w", padx=10)
+        # Title with Collapse Button
+        title_frame = ttk.Frame(main_frame)
+        title_frame.grid(row=0, column=0, columnspan=6, pady=10, sticky="ew", padx=10)
+        
+        title = ttk.Label(title_frame, text="Konfiguration", font=("Arial", 14, "bold"))
+        title.pack(side="left")
+        
+        collapse_btn = ttk.Button(title_frame, text="▼ Collapse", command=self.toggle_config_collapse, width=12)
+        collapse_btn.pack(side="right")
+        self.collapse_btn = collapse_btn
+        
+        # Frame to hold all config fields (this will be hidden/shown)
+        self.config_fields_frame = ttk.Frame(main_frame)
+        self.config_fields_frame.grid(row=1, column=0, columnspan=6, sticky="ew", padx=10)
         
         # OBS 1 Configuration Section
-        obs_label = ttk.Label(main_frame, text="OBS 1 WebSocket", font=("Arial", 11, "bold"), foreground="blue")
-        obs_label.grid(row=1, column=0, columnspan=2, pady=(10, 5), sticky="w", padx=10)
+        obs_label = ttk.Label(self.config_fields_frame, text="OBS 1 WebSocket", font=("Arial", 11, "bold"), foreground="blue")
+        obs_label.grid(row=0, column=0, columnspan=2, pady=(10, 5), sticky="w")
         
         # OBS 2 Configuration Section
-        obs2_label = ttk.Label(main_frame, text="OBS 2 WebSocket", font=("Arial", 11, "bold"), foreground="blue")
-        obs2_label.grid(row=1, column=2, columnspan=2, pady=(10, 5), sticky="w", padx=10)
+        obs2_label = ttk.Label(self.config_fields_frame, text="OBS 2 WebSocket", font=("Arial", 11, "bold"), foreground="blue")
+        obs2_label.grid(row=0, column=2, columnspan=2, pady=(10, 5), sticky="w")
         
         # OBS 1 Host
-        self.obs_host_input = self._create_config_field(main_frame, "Host:", 2, 0, config['OBS_HOST'])
+        self.obs_host_input = self._create_config_field(self.config_fields_frame, "Host:", 1, 0, config['OBS_HOST'])
         
         # OBS 2 Host
-        self.obs2_host_input = self._create_config_field(main_frame, "Host:", 2, 2, config['OBS2_HOST'])
+        self.obs2_host_input = self._create_config_field(self.config_fields_frame, "Host:", 1, 2, config['OBS2_HOST'])
         
         # OBS 1 Port
-        self.obs_port_input = self._create_config_field(main_frame, "Port:", 3, 0, str(config['OBS_PORT']))
+        self.obs_port_input = self._create_config_field(self.config_fields_frame, "Port:", 2, 0, str(config['OBS_PORT']))
         
         # OBS 2 Port
-        self.obs2_port_input = self._create_config_field(main_frame, "Port:", 3, 2, str(config['OBS2_PORT']))
+        self.obs2_port_input = self._create_config_field(self.config_fields_frame, "Port:", 2, 2, str(config['OBS2_PORT']))
         
         # OBS 1 Password
-        self.obs_password_input = self._create_config_field(main_frame, "Password:", 4, 0, config['OBS_PASSWORD'], show="*")
+        self.obs_password_input = self._create_config_field(self.config_fields_frame, "Password:", 3, 0, config['OBS_PASSWORD'], show="*")
         
         # OBS 2 Password
-        self.obs2_password_input = self._create_config_field(main_frame, "Password:", 4, 2, config['OBS2_PASSWORD'], show="*")
+        self.obs2_password_input = self._create_config_field(self.config_fields_frame, "Password:", 3, 2, config['OBS2_PASSWORD'], show="*")
         
         # SOS Configuration Section
-        sos_label = ttk.Label(main_frame, text="SOS WebSocket", font=("Arial", 11, "bold"), foreground="blue")
-        sos_label.grid(row=5, column=2, columnspan=2, pady=(10, 5), sticky="w", padx=10)
+        sos_label = ttk.Label(self.config_fields_frame, text="SOS WebSocket", font=("Arial", 11, "bold"), foreground="blue")
+        sos_label.grid(row=4, column=2, columnspan=2, pady=(10, 5), sticky="w")
         
         # SOS Host
-        self.sos_host_input = self._create_config_field(main_frame, "Host:", 6, 2, config['SOS_HOST'])
+        self.sos_host_input = self._create_config_field(self.config_fields_frame, "Host:", 5, 2, config['SOS_HOST'])
         
         # SOS Port
-        self.sos_port_input = self._create_config_field(main_frame, "Port:", 7, 2, str(config['SOS_PORT']))
+        self.sos_port_input = self._create_config_field(self.config_fields_frame, "Port:", 6, 2, str(config['SOS_PORT']))
         
         # Win Video Scene Name
-        self.obs_scene_input = self._create_config_field(main_frame, "Win Video Scene:", 5, 0, config['WIN_SCENE_NAME'])
-        
-        # Matchup Scene Name
-        self.matchup_scene_input = self._create_config_field(main_frame, "Matchup Scene:", 6, 0, config['MATCHUP_SCENE_NAME'])
+        self.obs_scene_input = self._create_config_field(self.config_fields_frame, "Win Video Scene:", 4, 0, config['WIN_SCENE_NAME'])
         
         # Audio Scene Name
-        self.audio_scene_input = self._create_config_field(main_frame, "Audio Scene:", 7, 0, config['AUDIO_SCENE_NAME'])
+        self.audio_scene_input = self._create_config_field(self.config_fields_frame, "Audio Scene:", 5, 0, config['AUDIO_SCENE_NAME'])
         
-        # Audio Source Name
-        self.audio_source_input = self._create_config_field(main_frame, "Win Audio Source:", 8, 0, config['AUDIO_SOURCE_NAME'])
+        # Audio Source Name (Win Stinger)
+        self.audio_source_input = self._create_config_field(self.config_fields_frame, "Win Audio Source:", 6, 0, config['AUDIO_SOURCE_NAME'])
+        
+        # Matchup Scene Name
+        self.matchup_scene_input = self._create_config_field(self.config_fields_frame, "Matchup Scene:", 7, 0, config['MATCHUP_SCENE_NAME'])
+        
+        # Matchup Audio Source Name
+        self.matchup_audio_source_input = self._create_config_field(self.config_fields_frame, "Matchup Audio:", 8, 0, config['MATCHUP_AUDIO_SOURCE_NAME'])
+        
+        # Matchup Audio Finale Source Name
+        self.matchup_audio_finale_source_input = self._create_config_field(self.config_fields_frame, "Matchup Audio Finale:", 9, 0, config['MATCHUP_AUDIO_FINALE_SOURCE_NAME'])
         
         # Goal Video Scene Name
-        self.goal_video_scene_input = self._create_config_field(main_frame, "Goal Video Scene:", 9, 0, config['GOAL_VIDEO_SCENE_NAME'])
+        self.goal_video_scene_input = self._create_config_field(self.config_fields_frame, "Goal Video Scene:", 10, 0, config['GOAL_VIDEO_SCENE_NAME'])
         
         # Goal Video Source Name
-        self.goal_video_source_input = self._create_config_field(main_frame, "Goal Video Source:", 10, 0, config['GOAL_VIDEO_SOURCE_NAME'])
+        self.goal_video_source_input = self._create_config_field(self.config_fields_frame, "Goal Video Source:", 11, 0, config['GOAL_VIDEO_SOURCE_NAME'])
         
         # Goal Audio Source Name
-        self.goal_audio_source_input = self._create_config_field(main_frame, "Goal Audio Source:", 11, 0, config['GOAL_AUDIO_SOURCE_NAME'])
+        self.goal_audio_source_input = self._create_config_field(self.config_fields_frame, "Goal Audio Source:", 12, 0, config['GOAL_AUDIO_SOURCE_NAME'])
         
         # Play Matchup Button
         self.play_matchup_btn = ttk.Button(main_frame, text="▶ Play Matchup", command=self.play_matchup)
-        self.play_matchup_btn.grid(row=9, column=2, columnspan=2, padx=20, pady=5, sticky="w")
+        self.play_matchup_btn.grid(row=2, column=0, columnspan=2, padx=20, pady=5, sticky="w")
         
         # Hide Matchup Button
         self.hide_matchup_btn = ttk.Button(main_frame, text="✕ Hide Matchup", command=self.hide_matchup)
-        self.hide_matchup_btn.grid(row=10, column=2, columnspan=2, padx=20, pady=5, sticky="w")
+        self.hide_matchup_btn.grid(row=2, column=2, columnspan=2, padx=20, pady=5, sticky="w")
         
         # Matches Section
         matches_label = ttk.Label(main_frame, text="Matches", font=("Arial", 11, "bold"), foreground="blue")
-        matches_label.grid(row=12, column=0, columnspan=4, pady=(15, 10), sticky="w", padx=10)
+        matches_label.grid(row=3, column=0, columnspan=4, pady=(15, 10), sticky="w", padx=10)
         
         # Column headers
-        ttk.Label(main_frame, text="Match", font=("Arial", 9, "bold")).grid(row=13, column=0, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Cyan Team", font=("Arial", 9, "bold")).grid(row=13, column=1, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Pink Team", font=("Arial", 9, "bold")).grid(row=13, column=2, padx=10, pady=5, sticky="w")
-        ttk.Label(main_frame, text="Test", font=("Arial", 9, "bold")).grid(row=13, column=3, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Match", font=("Arial", 9, "bold")).grid(row=4, column=0, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Cyan Team", font=("Arial", 9, "bold")).grid(row=4, column=1, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Pink Team", font=("Arial", 9, "bold")).grid(row=4, column=2, padx=10, pady=5, sticky="w")
+        ttk.Label(main_frame, text="Test", font=("Arial", 9, "bold")).grid(row=4, column=3, padx=10, pady=5, sticky="w")
         
         self.match_vars = []
         self.match_dropdowns_blue = []
@@ -991,7 +1029,7 @@ class ConfigGUI:
         
         # Create 7 matches
         for i in range(7):
-            row = 14 + i
+            row = 5 + i
             
             # Current Match Checkbox
             var = tk.BooleanVar(value=(i == config['CURRENT_MATCH']))
@@ -1054,6 +1092,19 @@ class ConfigGUI:
         entry.bind('<KeyRelease>', self.update_config)
         return entry
     
+    def toggle_config_collapse(self) -> None:
+        """Toggle collapse/expand state of the configuration section.
+        
+        Hides or shows all configuration fields above the Matches section.
+        """
+        self.config_collapsed = not self.config_collapsed
+        if self.config_collapsed:
+            self.config_fields_frame.grid_remove()
+            self.collapse_btn.config(text="▶ Expand")
+        else:
+            self.config_fields_frame.grid()
+            self.collapse_btn.config(text="▼ Collapse")
+    
     def set_current_match(self, match_idx: int) -> None:
         """Set the current match for manual testing.
         
@@ -1114,6 +1165,8 @@ class ConfigGUI:
         config['MATCHUP_SCENE_NAME'] = self.matchup_scene_input.get()
         config['AUDIO_SCENE_NAME'] = self.audio_scene_input.get()
         config['AUDIO_SOURCE_NAME'] = self.audio_source_input.get()
+        config['MATCHUP_AUDIO_SOURCE_NAME'] = self.matchup_audio_source_input.get()
+        config['MATCHUP_AUDIO_FINALE_SOURCE_NAME'] = self.matchup_audio_finale_source_input.get()
         
         config['GOAL_VIDEO_SCENE_NAME'] = self.goal_video_scene_input.get()
         config['GOAL_VIDEO_SOURCE_NAME'] = self.goal_video_source_input.get()
