@@ -8,6 +8,8 @@
   "MATCHUP_SCENE_NAME": "SCN Matchup Animation",
   "AUDIO_SCENE_NAME": "SCN Musik-Output",
   "AUDIO_SOURCE_NAME": "MED Game Win Stinger Audio",
+  "MATCHUP_AUDIO_SOURCE_NAME": "MED Matchup Audio",
+  "MATCHUP_AUDIO_FINALE_SOURCE_NAME": "MED Matchup Audio Finale",
   "GOAL_VIDEO_SCENE_NAME": "SCN Goal Video",
   "GOAL_VIDEO_SOURCE_NAME": "MED Goal Video",
   "GOAL_AUDIO_SOURCE_NAME": "MED Goal Audio",

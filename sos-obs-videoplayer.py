@@ -28,6 +28,7 @@ import time
 import threading
 from obswebsocket import obsws, requests as obs_requests
 import websockets
+from ws_subscriber import WsSubscriber
 import tkinter as tk
 from tkinter import ttk
 
@@ -187,7 +188,7 @@ class OBSSOSController:
         """Initialize controller with no active connections."""
         self.obs: obsws | None = None           # OBS instance 1 connection
         self.obs2: obsws | None = None          # OBS instance 2 connection
-        self.sos_ws: websockets.WebSocketClientProtocol | None = None  # SOS connection
+        self.sos_subscriber: WsSubscriber = WsSubscriber()  # SOS WebSocket subscriber
         self.obs_reconnect_task: asyncio.Task | None = None  # Task for OBS 1 reconnection monitoring
         self.obs2_reconnect_task: asyncio.Task | None = None  # Task for OBS 2 reconnection monitoring
     
@@ -242,26 +243,60 @@ class OBSSOSController:
         """
         return await self._connect_obs_instance(2)
     
-    async def connect_sos_with_retry(self) -> bool:
-        """Connect to SOS WebSocket server with retry logic.
+    async def init_sos_subscriber(self) -> bool:
+        """Initialize SOS WebSocket subscriber with event handlers.
         
-        Attempts to connect to SOS WebSocket at configured host/port.
-        Automatically retries on failure with RETRY_DELAY between attempts.
+        Sets up the WebSocket subscriber to connect to SOS and registers
+        event handlers for game events and connection state changes.
         
         Returns:
-            True if connection successful
+            True if initialization successful
         """
-        retry_count = 0
-        while True:
-            try:
-                self.sos_ws = await websockets.connect(f"ws://{config['SOS_HOST']}:{config['SOS_PORT']}")
-                print(f"✓ Mit SOS verbunden ({config['SOS_HOST']}:{config['SOS_PORT']})")
-                return True
-            except Exception as e:
-                retry_count += 1
-                print(f"⏳ SOS Wiederverbindung in {RETRY_DELAY} Sekunden... (Versuch {retry_count})")
-                print(f"   Fehler: {e}")
-                await asyncio.sleep(RETRY_DELAY)
+        try:
+            # Register event handlers
+            self.sos_subscriber.subscribe("game", "match_ended", self._handle_match_ended_event)
+            self.sos_subscriber.subscribe("game", "goal_scored", self._handle_goal_scored_event)
+            
+            # Register connection state handlers
+            self.sos_subscriber.subscribe("ws", "open", lambda _: print(f"✓ Mit SOS verbunden ({config['SOS_HOST']}:{config['SOS_PORT']})"))
+            self.sos_subscriber.subscribe("ws", "close", lambda _: print("✗ SOS Verbindung geschlossen"))
+            self.sos_subscriber.subscribe("ws", "error", lambda _: print("✗ SOS Verbindungsfehler"))
+            
+            # Initialize connection with retry built into ws_subscriber
+            await self.sos_subscriber.init(port=config['SOS_PORT'], debug=False)
+            return True
+        except Exception as e:
+            print(f"✗ Fehler beim Initialisieren des SOS Subscribers: {e}")
+            return False
+    
+    def _handle_match_ended_event(self, data) -> None:
+        """Handle match ended event from SOS WebSocket subscriber.
+        
+        Wrapper method to process match ended events and extract winner team number.
+        
+        Args:
+            data: Event data from SOS containing match result information
+        """
+        print("🎮 Match Ended Event!")
+        
+        # Extract winner_team_num from the event data
+        winner_team_num = data.get('winner_team_num') if data else None
+        
+        if winner_team_num is not None:
+            self.handle_match_ended(winner_team_num)
+        else:
+            print("✗ Kein winner_team_num gefunden!")
+    
+    def _handle_goal_scored_event(self, data) -> None:
+        """Handle goal scored event from SOS WebSocket subscriber.
+        
+        Wrapper method to process goal scored events.
+        
+        Args:
+            data: Event data from SOS containing goal information
+        """
+        print("⚽ Goal Scored Event!")
+        self.handle_goal_scored()
     
     def _is_obs_connected(self, obs_instance: obsws | None, obs_num: int) -> bool:
         """Check if OBS instance connection is still alive.
@@ -607,40 +642,20 @@ class OBSSOSController:
         self.play_goal_video()
         self.play_goal_audio()
     
-    async def listen_sos_events(self) -> None:
-        """Listen for SOS WebSocket events with automatic reconnection.
+    async def monitor_sos_events(self) -> None:
+        """Monitor SOS WebSocket connection and keep it alive.
         
-        Continuously monitors the SOS connection for match end events.
-        On connection loss, automatically attempts to reconnect.
-        Handles deserialization of JSON events and triggers appropriate actions.
+        The WebSocket subscriber handles the actual event listening and reconnection.
+        This method just keeps the connection alive and handles any cleanup.
         """
-        while True:
-            try:
-                async for message in self.sos_ws:
-                    data = json.loads(message)
-                    event = data.get('event', 'unknown')
-                    
-                    if event == 'game:match_ended':
-                        print("🎮 Match Ended Event!")
-                        
-                        # winner_team_num ist unter data.data verschachtelt
-                        winner_team_num = data.get('data', {}).get('winner_team_num')
-                        
-                        if winner_team_num is not None:
-                            self.handle_match_ended(winner_team_num)
-                        else:
-                            print("✗ Kein winner_team_num gefunden!")
-
-                    if event == 'game:goal_scored':
-                        self.handle_goal_scored()
-                        
-            except websockets.exceptions.ConnectionClosed:
-                print("✗ SOS Verbindung geschlossen - Wiederverbindung wird versucht...")
-                await self.connect_sos_with_retry()
-            except Exception as e:
-                print(f"✗ Fehler: {e} - Wiederverbindung wird versucht...")
-                await asyncio.sleep(5)
-                await self.connect_sos_with_retry()
+        try:
+            # Keep running while the subscriber is connected
+            while self.sos_subscriber.is_connected:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print("\n⏹ SOS Event Monitoring beendet")
+        finally:
+            await self.sos_subscriber.close()
     
     async def start_companion_server(self) -> None:
         """Start WebSocket server for Bitfocus Companion integration.
@@ -822,6 +837,9 @@ class OBSSOSController:
         Optionally starts Companion WebSocket server if enabled.
         Handles graceful shutdown when interrupted or on errors.
         """
+        # Store reference to current event loop for GUI callbacks
+        self._event_loop = asyncio.get_running_loop()
+        
         print("=== OBS + SOS Video Player ===\n")
         
         # Start Companion server if enabled
@@ -833,7 +851,7 @@ class OBSSOSController:
         obs_result, obs2_result, sos_result = await asyncio.gather(
             self.connect_obs_with_retry(),
             self.connect_obs2_with_retry(),
-            self.connect_sos_with_retry(),
+            self.init_sos_subscriber(),
             return_exceptions=False
         )
         
@@ -842,6 +860,7 @@ class OBSSOSController:
             return
         
         if not sos_result:
+            print("✗ SOS Subscriber konnte nicht initialisiert werden")
             if self.obs:
                 self.obs.disconnect()
             if self.obs2:
@@ -857,7 +876,7 @@ class OBSSOSController:
             self.obs2_reconnect_task = asyncio.create_task(self._monitor_obs_connection(2))
         
         try:
-            await self.listen_sos_events()
+            await self.monitor_sos_events()
         except KeyboardInterrupt:
             print("\n⏹ Beendet")
         finally:
@@ -884,8 +903,7 @@ class OBSSOSController:
                 self.obs.disconnect()
             if self.obs2:
                 self.obs2.disconnect()
-            if self.sos_ws:
-                await self.sos_ws.close()
+            await self.sos_subscriber.close()
 
 class ConfigGUI:
     """Configuration GUI for OBS SOS Video Player.
@@ -894,13 +912,15 @@ class ConfigGUI:
     scene names, matches, and manual testing of video playback.
     """
     
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, controller: 'OBSSOSController' = None) -> None:
         """Initialize configuration GUI.
         
         Args:
             root: Tkinter root window
+            controller: Optional reference to the main controller for reconnections
         """
         self.root = root
+        self.controller = controller
         self.root.title("OBS SOS Video Player - Konfiguration")
         self.root.geometry("620x700")
         self.root.resizable(True, True)
@@ -1005,6 +1025,10 @@ class ConfigGUI:
         # Goal Audio Source Name
         self.goal_audio_source_input = self._create_config_field(self.config_fields_frame, "Goal Audio Source:", 12, 0, config['GOAL_AUDIO_SOURCE_NAME'])
         
+        # Save Config Button
+        self.save_config_btn = ttk.Button(self.config_fields_frame, text="💾 Save Configuration", command=self.save_config_and_reconnect, width=25)
+        self.save_config_btn.grid(row=13, column=0, columnspan=4, padx=20, pady=15, sticky="w")
+        
         # Play Matchup Button
         self.play_matchup_btn = ttk.Button(main_frame, text="▶ Play Matchup", command=self.play_matchup)
         self.play_matchup_btn.grid(row=2, column=0, columnspan=2, padx=20, pady=5, sticky="w")
@@ -1089,7 +1113,6 @@ class ConfigGUI:
         entry = ttk.Entry(parent, width=18, show=show)
         entry.insert(0, default_value)
         entry.grid(row=row, column=column + 1, padx=20, pady=5, sticky="w")
-        entry.bind('<KeyRelease>', self.update_config)
         return entry
     
     def toggle_config_collapse(self) -> None:
@@ -1137,15 +1160,12 @@ class ConfigGUI:
             config['MATCHES'][match_idx]['orange_team'] = self.match_dropdowns_orange[match_idx].get()
         save_config()
     
-    def update_config(self, event=None) -> None:
-        """Update configuration in real-time as user types.
+    def save_config_and_reconnect(self) -> None:
+        """Save configuration from GUI fields and trigger reconnections.
         
-        Called on every KeyRelease event in any config field.
-        Updates the global config dict and persists to file.
-        Handles type conversion for port numbers gracefully.
-        
-        Args:
-            event: Tkinter event object (optional, ignored)
+        Reads all configuration values from GUI input fields, validates them,
+        updates the global config dict and persists to file. Then triggers
+        reconnection to all services with the new configuration.
         """
         config['OBS_HOST'] = self.obs_host_input.get()
         try:
@@ -1179,6 +1199,47 @@ class ConfigGUI:
             pass
         
         save_config()
+        
+        # Trigger reconnections if controller is available
+        if self.controller:
+            print("💾 Configuration saved! Reconnecting to services...")
+            # Schedule the reconnection in the controller's event loop
+            if hasattr(self.controller, '_event_loop') and self.controller._event_loop:
+                # Use call_soon_threadsafe to schedule in the main event loop
+                self.controller._event_loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self._trigger_reconnections())
+                )
+            else:
+                print("⚠️ Event loop not available, reconnection skipped")
+        else:
+            print("💾 Configuration saved!")
+    
+    async def _trigger_reconnections(self) -> None:
+        """Trigger reconnection to all services with new configuration."""
+        try:
+            # Disconnect existing connections
+            if self.controller.obs:
+                self.controller.obs.disconnect()
+                self.controller.obs = None
+            if self.controller.obs2:
+                self.controller.obs2.disconnect()
+                self.controller.obs2 = None
+            await self.controller.sos_subscriber.close()
+            
+            print("🔄 Reconnecting to OBS and SOS...")
+            
+            # Reconnect with new configuration
+            obs1_task = asyncio.create_task(self.controller.connect_obs_with_retry())
+            obs2_task = asyncio.create_task(self.controller.connect_obs2_with_retry())
+            sos_task = asyncio.create_task(self.controller.init_sos_subscriber())
+            
+            # Wait for all connections
+            await asyncio.gather(obs1_task, obs2_task, sos_task, return_exceptions=True)
+            
+            print("✅ Reconnection completed!")
+            
+        except Exception as e:
+            print(f"❌ Error during reconnection: {e}")
     
     def test_win(self, match_idx: int, winner_team_num: int) -> None:
         """Manually trigger victory video for testing.
@@ -1256,13 +1317,12 @@ if __name__ == "__main__":
     # Lade Config
     load_config()
     
-    # Starte GUI
-    root = tk.Tk()
-    gui = ConfigGUI(root)
-    
     # Erstelle Controller
     app_controller = OBSSOSController()
-    gui.controller = app_controller
+    
+    # Starte GUI
+    root = tk.Tk()
+    gui = ConfigGUI(root, app_controller)
     
     # Starte Async Loop in separatem Thread
     loop = asyncio.new_event_loop()
